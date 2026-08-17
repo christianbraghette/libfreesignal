@@ -1,6 +1,5 @@
-use crate::UserId;
-use crate::double_ratchet::{HeaderKey, RootKey, SessionInit};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use crate::{HeaderKey, KeyExchangeStore, RootKey, UserId, SessionInit};
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -41,14 +40,6 @@ pub struct PreKeyMessage {
     pub ephemeral_key: PublicKey,
     pub signed_pre_key_hash: [u8; HASH_LENGTH],
     pub onetime_pre_key_hash: Option<[u8; HASH_LENGTH]>,
-}
-
-pub trait KeyExchangeStore {
-    fn get_secret_key(&self) -> StaticSecret;
-    fn get_signing_key(&self) -> SigningKey;
-    fn store_pre_key(&self, prekey_hash: &[u8], prekey: &StaticSecret);
-    fn load_pre_key(&self, prekey_hash: &[u8]) -> Option<StaticSecret>;
-    fn remove_pre_key(&self, prekey_hash: &[u8]) -> bool;
 }
 
 const PUBLIC_ID_INFO: &[u8] = b"freesignal/user_id/v0.1";
