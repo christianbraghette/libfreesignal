@@ -43,6 +43,7 @@ pub trait Header {
 pub struct SessionInit {
     pub user_id: UserId,
     pub remote_key: Option<PublicKey>,
+    pub secret_key: Option<StaticSecret>,
     pub root_key: RootKey,
     pub header_key: Option<HeaderKey>,
     pub next_header_key: Option<HeaderKey>,

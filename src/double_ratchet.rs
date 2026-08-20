@@ -22,7 +22,7 @@ impl std::fmt::Display for DoubleRatchetError {
         match self {
             Self::NoSendingChain => write!(f, "Uninitialized sending chain"),
             Self::ChainNotFound => write!(f, "Chain not found"),
-            Self::MaxSkipExceeded => write!(f, "Message count exceeds MAX_SKIP threshold (DoS protection)"),
+            Self::MaxSkipExceeded => write!(f, "Message count exceeds MAX_SKIP threshold"),
             Self::InvalidMessageCount => write!(f, "Invalid message count in header"),
             Self::ChainInitFailed => write!(f, "Failed chain init"),
         }
@@ -157,7 +157,10 @@ impl<K: SessionKeyStore<SessionData>>
                 root_key: init.root_key.clone(),
                 header_key: init.header_key.clone(),
                 next_header_key: init.next_header_key.clone(),
-                secret_key: StaticSecret::random_from_rng(rand_core::OsRng),
+                secret_key: init
+                    .secret_key
+                    .clone()
+                    .unwrap_or_else(|| StaticSecret::random_from_rng(rand_core::OsRng)),
                 sending_chain: None,
                 receiving_chain: None,
             },
@@ -387,7 +390,6 @@ impl Chain {
         let mut msg_key = [0u8; 32];
         msg_key.copy_from_slice(&hash_key[32..64]);
 
-        // Pulizia esplicita dello stack
         hash_key.zeroize();
 
         self.count += 1;
@@ -489,6 +491,7 @@ mod tests {
             user_id: UserId(Sha256::digest("bob").into()),
             remote_key: None, // Bob aspetta che Alice inizi
             root_key: shared_root_key.clone(),
+            secret_key: None,
             header_key: None,
             next_header_key: None,
         };
@@ -500,6 +503,7 @@ mod tests {
         let alice_init = SessionInit {
             user_id: UserId(Sha256::digest("alice").into()),
             remote_key: Some(bob_public_key), // Alice conosce la chiave di Bob
+            secret_key: None,
             root_key: shared_root_key,
             header_key: None,
             next_header_key: None,
@@ -576,6 +580,7 @@ mod tests {
         let bob_init = SessionInit {
             user_id: UserId(Sha256::digest("bob").into()),
             remote_key: None,
+            secret_key: None,
             root_key: shared_root_key.clone(),
             header_key: None,
             next_header_key: None,
@@ -587,6 +592,7 @@ mod tests {
         let alice_init = SessionInit {
             user_id: UserId(Sha256::digest("alice").into()),
             remote_key: Some(bob_public_key),
+            secret_key: None,
             root_key: shared_root_key,
             header_key: None,
             next_header_key: None,
@@ -668,6 +674,7 @@ mod tests {
             user_id: UserId([1u8; 32]),
             remote_key: Some(bob_pubkey),
             root_key: shared_root_key,
+            secret_key: Some(bob_secret),
             header_key: Some(initial_header_key.clone()),
             next_header_key: None,
         };

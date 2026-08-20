@@ -9,7 +9,7 @@ use zeroize::Zeroize;
 const KEY_LENGTH: usize = 32;
 const HASH_LENGTH: usize = 32;
 const X3DH_INFO: &[u8] = b"/freesignal/x3dh/v0.1";
-const PREFIX_F: [u8; 32] = [0xFF; 32]; // Prefisso F per la Domain Separation (Spec X3DH 3.3)
+const PREFIX_F: [u8; 32] = [0xFF; 32];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyExchangeError {
@@ -27,8 +27,6 @@ impl std::fmt::Display for KeyExchangeError {
 }
 impl std::error::Error for KeyExchangeError {}
 
-/// Mappa una chiave di firma Ed25519 in una chiave privata X25519 equivalente.
-/// Applica l'hashing SHA-512 al seed ed estrae i primi 32 byte.
 pub fn get_identity_x25519_secret(signing_key: &SigningKey) -> StaticSecret {
     let hash = Sha512::digest(signing_key.as_bytes());
     let mut scalar_bytes = [0u8; 32];
@@ -171,11 +169,9 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         let onetime_pre_key_hash: Option<[u8; 32]> =
             onetime_pre_key.map(|data| Sha256::digest(data.as_bytes()).into());
 
-        // Array esteso per includere il prefisso F (32 byte) + 4 risultati DH (32 byte ciascuno)
         let mut raw: [u8; KEY_LENGTH * 5] = [0u8; KEY_LENGTH * 5];
         let mut raw_len = KEY_LENGTH * 4;
 
-        // Prefisso F per la Domain Separation
         raw[..KEY_LENGTH].copy_from_slice(&PREFIX_F);
 
         let identity_x25519_secret = get_identity_x25519_secret(&self.keystore.get_signing_key());
@@ -217,7 +213,8 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         Ok((
             SessionInit {
                 user_id: self.identity.get_user_id(),
-                remote_key: Some(self.identity.to_public_key()),
+                remote_key: Some(bundle.signed_pre_key), // Imposta la SPK di Bob come remote_key iniziale
+                secret_key: None,
                 root_key,
                 header_key: Some(header_key),
                 next_header_key: Some(next_header_key),
@@ -252,7 +249,6 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         let mut raw: [u8; KEY_LENGTH * 5] = [0u8; KEY_LENGTH * 5];
         let mut raw_len = KEY_LENGTH * 4;
 
-        // Prefisso F per la Domain Separation
         raw[..KEY_LENGTH].copy_from_slice(&PREFIX_F);
 
         let identity_x25519_secret = get_identity_x25519_secret(&self.keystore.get_signing_key());
@@ -293,7 +289,8 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 
         Ok(SessionInit {
             user_id: self.identity.get_user_id(),
-            remote_key: Some(self.identity.to_public_key()),
+            remote_key: None,
+            secret_key: Some(signed_pre_key), // Bob userà la sua SPK come ratchet secret key iniziale
             root_key,
             header_key: Some(header_key),
             next_header_key: Some(next_header_key),
@@ -304,8 +301,8 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::double_ratchet::{Header, SessionData};
-    use crate::{Header as HeaderTrait, Session as SessionTrait, SessionKeyStore};
+    use crate::double_ratchet::SessionData;
+    use crate::{Session as SessionTrait, SessionKeyStore};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use std::cell::RefCell;
@@ -433,25 +430,21 @@ mod tests {
         assert_eq!(store_guard.len(), MAX_OPK + 1);
     }
 
-    // --- TEST DI INTEGRAZIONE END-TO-END (ALICE <-> BOB) ---
     #[test]
     fn test_x3dh_full_handshake_end_to_end() {
-        // 1. Bob crea la sua identità e genera il bundle X3DH
         let bob_keystore = MockKeyStore::new();
         let bob_identity = create_test_identity(&bob_keystore);
-        let bob_kx = KeyExchange::new(bob_identity.clone(), bob_keystore.clone());
+        let bob_kx = KeyExchange::new(bob_identity, bob_keystore);
         let bob_bundle: PreKeyBundle<5> = bob_kx.create_pre_key_bundle();
 
-        // 2. Alice processa il bundle di Bob per iniziare la sessione
         let alice_keystore = MockKeyStore::new();
         let alice_identity = create_test_identity(&alice_keystore);
-        let alice_kx = KeyExchange::new(alice_identity.clone(), alice_keystore.clone());
+        let alice_kx = KeyExchange::new(alice_identity, alice_keystore);
 
         let (alice_init, pre_key_msg) = alice_kx
             .process_pre_key_bundle(&bob_bundle)
             .expect("Alice deve elaborare il bundle con successo");
 
-        // 3. Bob processa il PreKeyMessage inviato da Alice
         let bob_init = bob_kx
             .process_pre_key_message(pre_key_msg)
             .expect("Bob deve elaborare il messaggio con successo");
@@ -472,7 +465,6 @@ mod tests {
         let mut alice_dr = DR::new(&alice_init, MemorySessionKeystore::default());
         let mut bob_dr = DR::new(&bob_init, MemorySessionKeystore::default());
 
-        // Alice invia un messaggio a Bob
         let (alice_msg_key, header, _) = alice_dr.get_sending_key().unwrap();
         let bob_msg_key = bob_dr.get_receiving_key(&header).unwrap();
 
@@ -489,7 +481,7 @@ mod tests {
         let bob_kx = KeyExchange::new(bob_identity, bob_keystore);
 
         let mut bundle: PreKeyBundle<0> = bob_kx.create_pre_key_bundle();
-        bundle.onetime_pre_keys = None; // Nessuna OPK usata
+        bundle.onetime_pre_keys = None;
 
         let alice_keystore = MockKeyStore::new();
         let alice_identity = create_test_identity(&alice_keystore);
