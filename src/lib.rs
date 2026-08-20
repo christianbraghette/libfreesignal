@@ -1,5 +1,3 @@
-use std::error::Error;
-
 use ed25519_dalek::SigningKey;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -50,25 +48,19 @@ pub struct SessionInit {
 }
 
 pub trait SessionKeyStore<Data> {
-    fn get_tag(&self) -> SessionTag;
-    fn set_data(&self, session: &Data);
-    fn get_data(&self, public_key_hash: &KeyHash) -> Option<Data>;
+    fn set_data(&self, public_key: &SessionTag, session: &Data);
+    fn set_public_key(&self, public_key: &PublicKey, session_tag: &SessionTag);
+    fn get_data_by_key(&self, public_key: &PublicKey) -> Option<Data>;
+    fn get_data_by_tag(&self, session_tag: &SessionTag) -> Option<Data>;
+
     fn set_header_key(&self, header_key: &KeyHash, value: &HeaderKey);
     fn get_header_key(&self, header_key: &KeyHash) -> Option<HeaderKey>;
+
     fn set_previous_keys(&self, hash: &HeaderHash, value: &MessageKey);
     fn get_previous_keys(&self, hash: &HeaderHash) -> Option<MessageKey>;
-    fn del_previous_keys(&self) -> bool;
-    fn has_skipped_keys(&self) -> bool;
+    fn del_previous_keys(&self, hash: Option<&HeaderHash>) -> bool;
+    fn has_previous_keys(&self) -> bool;
+
     fn commit(&self);
     fn rollback(&self) -> bool;
-}
-
-pub trait Session<Data, K: SessionKeyStore<Data>, H: Header, E: Error> {
-    fn new(init: &SessionInit, keystore: K) -> Self;
-    fn commit(&mut self);
-    fn rollback(&mut self) -> bool;
-    fn get_sending_key(&mut self) -> Result<(MessageKey, H, Option<HeaderKey>), E>;
-    fn get_receiving_key(&mut self, header: &H) -> Result<MessageKey, E>;
-    fn has_skipped_keys(&self) -> bool;
-    fn from_header(hash: &KeyHash, header: &[u8], keystore: K) -> (Option<HeaderKey>, Self);
 }

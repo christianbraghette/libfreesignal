@@ -157,6 +157,8 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
             .verify_strict(bundle.signed_pre_key.as_ref(), &bundle.signature)
             .map_err(|_| KeyExchangeError::VerificationError)?;
 
+        let remote_user_id = PublicIdentity(bundle.identity_key).get_user_id();
+
         let onetime_pre_key = bundle.onetime_pre_keys.as_ref().and_then(|keys| {
             if keys.is_empty() {
                 None
@@ -176,14 +178,12 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 
         let identity_x25519_secret = get_identity_x25519_secret(&self.keystore.get_signing_key());
 
-        // DH1 = DH(IK_A, SPK_B)
         raw[KEY_LENGTH..KEY_LENGTH * 2].copy_from_slice(
             identity_x25519_secret
                 .diffie_hellman(&bundle.signed_pre_key)
                 .as_bytes(),
         );
 
-        // DH2 = DH(EK_A, IK_B)
         raw[KEY_LENGTH * 2..KEY_LENGTH * 3].copy_from_slice(
             ephemeral_key
                 .diffie_hellman(&PublicKey::from(
@@ -192,14 +192,12 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
                 .as_bytes(),
         );
 
-        // DH3 = DH(EK_A, SPK_B)
         raw[KEY_LENGTH * 3..KEY_LENGTH * 4].copy_from_slice(
             ephemeral_key
                 .diffie_hellman(&bundle.signed_pre_key)
                 .as_bytes(),
         );
 
-        // DH4 = DH(EK_A, OPK_B)
         if let Some(pre_key) = onetime_pre_key {
             raw[KEY_LENGTH * 4..]
                 .copy_from_slice(ephemeral_key.diffie_hellman(&pre_key).as_bytes());
@@ -212,8 +210,8 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 
         Ok((
             SessionInit {
-                user_id: self.identity.get_user_id(),
-                remote_key: Some(bundle.signed_pre_key), // Imposta la SPK di Bob come remote_key iniziale
+                user_id: remote_user_id, // Associa il UserId remoto a SessionInit
+                remote_key: Some(bundle.signed_pre_key),
                 secret_key: None,
                 root_key,
                 header_key: Some(header_key),
@@ -232,19 +230,27 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         &self,
         message: PreKeyMessage,
     ) -> Result<SessionInit, KeyExchangeError> {
+        let remote_user_id = PublicIdentity(message.identity_key).get_user_id();
+
         let signed_pre_key = self
             .keystore
             .load_pre_key(&message.signed_pre_key_hash)
             .ok_or(KeyExchangeError::PreKeyNotFound)?;
 
-        let mut hash = [0u8; HASH_LENGTH * 2];
-        hash[..KEY_LENGTH].copy_from_slice(&message.signed_pre_key_hash);
-        if let Some(onetime_pre_key_hash) = message.onetime_pre_key_hash {
-            hash[KEY_LENGTH..].copy_from_slice(&onetime_pre_key_hash);
-        }
+        let onetime_pre_key = if let Some(opk_hash) = message.onetime_pre_key_hash {
+            let mut hash = [0u8; HASH_LENGTH * 2];
+            hash[..KEY_LENGTH].copy_from_slice(&message.signed_pre_key_hash);
+            hash[KEY_LENGTH..].copy_from_slice(&opk_hash);
 
-        let onetime_pre_key = self.keystore.load_pre_key(&hash);
-        self.keystore.remove_pre_key(&hash);
+            let key = self
+                .keystore
+                .load_pre_key(&hash)
+                .ok_or(KeyExchangeError::PreKeyNotFound)?;
+            self.keystore.remove_pre_key(&hash);
+            Some(key)
+        } else {
+            None
+        };
 
         let mut raw: [u8; KEY_LENGTH * 5] = [0u8; KEY_LENGTH * 5];
         let mut raw_len = KEY_LENGTH * 4;
@@ -253,7 +259,6 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 
         let identity_x25519_secret = get_identity_x25519_secret(&self.keystore.get_signing_key());
 
-        // DH1 = DH(SPK_B, IK_A)
         raw[KEY_LENGTH..KEY_LENGTH * 2].copy_from_slice(
             signed_pre_key
                 .diffie_hellman(&PublicKey::from(
@@ -262,21 +267,18 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
                 .as_bytes(),
         );
 
-        // DH2 = DH(IK_B, EK_A)
         raw[KEY_LENGTH * 2..KEY_LENGTH * 3].copy_from_slice(
             identity_x25519_secret
                 .diffie_hellman(&message.ephemeral_key)
                 .as_bytes(),
         );
 
-        // DH3 = DH(SPK_B, EK_A)
         raw[KEY_LENGTH * 3..KEY_LENGTH * 4].copy_from_slice(
             signed_pre_key
                 .diffie_hellman(&message.ephemeral_key)
                 .as_bytes(),
         );
 
-        // DH4 = DH(OPK_B, EK_A)
         if let Some(pre_key) = onetime_pre_key {
             raw[KEY_LENGTH * 4..]
                 .copy_from_slice(pre_key.diffie_hellman(&message.ephemeral_key).as_bytes());
@@ -288,9 +290,9 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         raw.zeroize();
 
         Ok(SessionInit {
-            user_id: self.identity.get_user_id(),
+            user_id: remote_user_id, // Associa il UserId di Alice a SessionInit
             remote_key: None,
-            secret_key: Some(signed_pre_key), // Bob userà la sua SPK come ratchet secret key iniziale
+            secret_key: Some(signed_pre_key),
             root_key,
             header_key: Some(header_key),
             next_header_key: Some(next_header_key),
@@ -302,7 +304,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 mod tests {
     use super::*;
     use crate::double_ratchet::SessionData;
-    use crate::{Session as SessionTrait, SessionKeyStore};
+    use crate::{SessionKeyStore};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use std::cell::RefCell;
@@ -376,22 +378,18 @@ mod tests {
             true
         }
 
-        fn has_skipped_keys(&self) -> bool {
+        fn has_previous_keys(&self) -> bool {
             !self.previous_keys.borrow().is_empty()
         }
 
-        fn set_data(&self, _session: &SessionData) {}
+        fn set_data_by_key(&self, _session: &SessionData) {}
         fn commit(&self) {}
         fn rollback(&self) -> bool {
             true
         }
 
-        fn get_data(&self, hash: &[u8; 32]) -> Option<SessionData> {
+        fn get_data_by_key(&self, hash: &[u8; 32]) -> Option<SessionData> {
             self.session_data.borrow().get(hash).cloned()
-        }
-        
-        fn get_tag(&self) -> crate::SessionTag {
-            todo!()
         }
     }
 
