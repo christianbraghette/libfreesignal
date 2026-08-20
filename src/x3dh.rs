@@ -1,4 +1,4 @@
-use crate::{HeaderKey, KeyExchangeStore, RootKey, SessionInit, UserId};
+use crate::{HeaderKey, KeyExchangeStore, PublicIdentity, RootKey, SessionInit};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
@@ -48,33 +48,6 @@ pub struct PreKeyMessage {
     pub ephemeral_key: PublicKey,
     pub signed_pre_key_hash: [u8; HASH_LENGTH],
     pub onetime_pre_key_hash: Option<[u8; HASH_LENGTH]>,
-}
-
-const PUBLIC_ID_INFO: &[u8] = b"freesignal/user_id/v0.1";
-
-#[derive(Clone)]
-pub struct PublicIdentity(pub VerifyingKey);
-
-impl PublicIdentity {
-    pub fn get_user_id(&self) -> UserId {
-        let mut user_id = [0u8; KEY_LENGTH];
-        let hkdf = Hkdf::<Sha256>::new(Some(&[0u8; KEY_LENGTH]), self.0.as_bytes());
-        hkdf.expand(PUBLIC_ID_INFO, &mut user_id)
-            .expect("HKDF failed");
-        UserId(user_id)
-    }
-
-    pub fn get_key(&self) -> VerifyingKey {
-        self.0
-    }
-
-    pub fn to_public_key(&self) -> PublicKey {
-        PublicKey::from(self.0.to_montgomery().to_bytes())
-    }
-
-    pub fn to_bytes(&self) -> [u8; 32] {
-        self.0.to_bytes()
-    }
 }
 
 pub struct KeyExchange<K: KeyExchangeStore> {
@@ -304,7 +277,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 mod tests {
     use super::*;
     use crate::double_ratchet::SessionData;
-    use crate::{SessionKeyStore};
+    use crate::{SessionKeyStore, SessionTag, HeaderHash};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use std::cell::RefCell;
@@ -354,6 +327,7 @@ mod tests {
         header_keys: Rc<RefCell<HashMap<[u8; 32], HeaderKey>>>,
         previous_keys: Rc<RefCell<HashMap<[u8; 32], crate::MessageKey>>>,
         session_data: Rc<RefCell<HashMap<[u8; 32], SessionData>>>,
+        pub_key_map: Rc<RefCell<HashMap<[u8; 32], SessionTag>>>,
     }
 
     impl SessionKeyStore<SessionData> for MemorySessionKeystore {
@@ -373,23 +347,39 @@ mod tests {
             self.previous_keys.borrow_mut().remove(key)
         }
 
-        fn del_previous_keys(&self) -> bool {
-            self.previous_keys.borrow_mut().clear();
-            true
+        fn del_previous_keys(&self, hash: Option<&HeaderHash>) -> bool {
+            if let Some(h) = hash {
+                self.previous_keys.borrow_mut().remove(h).is_some()
+            } else {
+                self.previous_keys.borrow_mut().clear();
+                true
+            }
         }
 
         fn has_previous_keys(&self) -> bool {
             !self.previous_keys.borrow().is_empty()
         }
 
-        fn set_data_by_key(&self, _session: &SessionData) {}
+        fn set_data(&self, public_key: &SessionTag, session: &SessionData) {
+            self.session_data.borrow_mut().insert(public_key.0, session.clone());
+        }
+
+        fn set_public_key(&self, public_key: &PublicKey, session_tag: &SessionTag) {
+            self.pub_key_map.borrow_mut().insert(public_key.to_bytes(), session_tag.clone());
+        }
+
+        fn get_data_by_key(&self, public_key: &PublicKey) -> Option<SessionData> {
+            let tag = self.pub_key_map.borrow().get(&public_key.to_bytes()).cloned()?;
+            self.get_data_by_tag(&tag)
+        }
+
+        fn get_data_by_tag(&self, session_tag: &SessionTag) -> Option<SessionData> {
+            self.session_data.borrow().get(&session_tag.0).cloned()
+        }
+
         fn commit(&self) {}
         fn rollback(&self) -> bool {
             true
-        }
-
-        fn get_data_by_key(&self, hash: &[u8; 32]) -> Option<SessionData> {
-            self.session_data.borrow().get(hash).cloned()
         }
     }
 

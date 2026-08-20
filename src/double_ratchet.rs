@@ -188,7 +188,15 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
 
     pub fn commit(&mut self) {
         self.previous = Some(self.current.clone());
-        self.keystore.set_data_by_key(&self.current);
+        self.keystore.set_data(&self.session_tag, &self.current);
+        
+        // Mappa la chiave pubblica remota al tag della sessione, se disponibile.
+        if let Some(chain) = &self.current.sending_chain {
+            self.keystore.set_public_key(&chain.remote_key, &self.session_tag);
+        } else if let Some(chain) = &self.current.receiving_chain {
+            self.keystore.set_public_key(&chain.remote_key, &self.session_tag);
+        }
+        
         self.keystore.commit();
     }
 
@@ -332,7 +340,7 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
     ) -> (Option<HeaderKey>, Self) {
         let is_unencrypted = hash.iter().all(|&b| b == 0);
 
-        let (header_key, lookup_hash) = if is_unencrypted {
+        let (header_key, session_data) = if is_unencrypted {
             let mut remote_key_bytes = [0u8; 32];
             if header_bytes.len() >= 36 {
                 remote_key_bytes.copy_from_slice(&header_bytes[4..36]);
@@ -340,24 +348,24 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
                 remote_key_bytes.copy_from_slice(&header_bytes[..32]);
             }
 
-            let computed_hash: [u8; 32] = Sha256::digest(&remote_key_bytes).into();
-            (None, computed_hash)
+            let public_key = PublicKey::from(remote_key_bytes);
+            (None, keystore.get_data_by_key(&public_key))
         } else {
             let hk = keystore.get_header_key(hash);
-            (hk, *hash)
+            // Convertiamo in tag se le chiavi erano cifrate
+            let session_tag = SessionTag(*hash);
+            (hk, keystore.get_data_by_tag(&session_tag))
         };
 
-        let session_data = keystore
-            .get_data_by_key(&lookup_hash)
-            .unwrap_or_else(|| SessionData {
-                user_id: UserId([0u8; 32]),
-                secret_key: StaticSecret::random_from_rng(rand_core::OsRng),
-                root_key: RootKey([0u8; 32]),
-                header_key: header_key.clone(),
-                next_header_key: None,
-                sending_chain: None,
-                receiving_chain: None,
-            });
+        let session_data = session_data.unwrap_or_else(|| SessionData {
+            user_id: UserId([0u8; 32]),
+            secret_key: StaticSecret::random_from_rng(rand_core::OsRng),
+            root_key: RootKey([0u8; 32]),
+            header_key: header_key.clone(),
+            next_header_key: None,
+            sending_chain: None,
+            receiving_chain: None,
+        });
 
         let mut session_tag = [0u8; KEY_LENGTH];
         let hkdf = Hkdf::<Sha256>::new(Some(&[0u8; KEY_LENGTH]), session_data.root_key.0.as_ref());
@@ -436,6 +444,7 @@ mod tests {
         header_keys: Rc<RefCell<HashMap<KeyHash, HeaderKey>>>,
         previous_keys: Rc<RefCell<HashMap<HeaderHash, MessageKey>>>,
         session_data: Rc<RefCell<HashMap<[u8; 32], SessionData>>>,
+        pub_key_map: Rc<RefCell<HashMap<[u8; 32], SessionTag>>>, // Aggiunto per set_public_key
     }
 
     impl MemoryKeystore {
@@ -465,27 +474,40 @@ mod tests {
             self.previous_keys.borrow_mut().remove(key)
         }
 
-        fn del_previous_keys(&self) -> bool {
-            self.previous_keys.borrow_mut().clear();
-            true
+        fn del_previous_keys(&self, hash: Option<&HeaderHash>) -> bool {
+            if let Some(h) = hash {
+                self.previous_keys.borrow_mut().remove(h).is_some()
+            } else {
+                self.previous_keys.borrow_mut().clear();
+                true
+            }
         }
 
         fn has_previous_keys(&self) -> bool {
             !self.previous_keys.borrow().is_empty()
         }
 
-        fn set_data_by_key(&self, _session: &SessionData) {}
+        fn set_data(&self, public_key: &SessionTag, session: &SessionData) {
+            self.session_data.borrow_mut().insert(public_key.0, session.clone());
+        }
+
+        fn set_public_key(&self, public_key: &PublicKey, session_tag: &SessionTag) {
+            self.pub_key_map.borrow_mut().insert(public_key.to_bytes(), session_tag.clone());
+        }
+
+        fn get_data_by_key(&self, public_key: &PublicKey) -> Option<SessionData> {
+            let tag = self.pub_key_map.borrow().get(&public_key.to_bytes()).cloned()?;
+            self.get_data_by_tag(&tag)
+        }
+
+        fn get_data_by_tag(&self, session_tag: &SessionTag) -> Option<SessionData> {
+            self.session_data.borrow().get(&session_tag.0).cloned()
+        }
+
         fn commit(&self) {}
+        
         fn rollback(&self) -> bool {
             true
-        }
-
-        fn get_data_by_key(&self, hash: &[u8; 32]) -> Option<SessionData> {
-            self.session_data.borrow().get(hash).cloned()
-        }
-
-        fn get_tag(&self) -> SessionTag {
-            todo!()
         }
     }
 
@@ -649,7 +671,7 @@ mod tests {
 
         // Se il KeyHash è formato da soli zeri, la HeaderKey deve essere None
         assert!(header_key.is_none());
-        assert_eq!(session.user_id, UserId([0u8; 32]));
+        assert_eq!(session.get_user_id(), UserId([0u8; 32]));
     }
 
     #[test]

@@ -1,4 +1,6 @@
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -29,6 +31,34 @@ pub struct RootKey(pub [u8; 32]);
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq, Debug)]
 pub struct HeaderKey(pub [u8; 32]);
+
+const KEY_LENGTH: usize = 32;
+const PUBLIC_ID_INFO: &[u8] = b"freesignal/user_id/v0.1";
+
+#[derive(Clone)]
+pub struct PublicIdentity(pub VerifyingKey);
+
+impl PublicIdentity {
+    pub fn get_user_id(&self) -> UserId {
+        let mut user_id = [0u8; KEY_LENGTH];
+        let hkdf = Hkdf::<Sha256>::new(Some(&[0u8; KEY_LENGTH]), self.0.as_bytes());
+        hkdf.expand(PUBLIC_ID_INFO, &mut user_id)
+            .expect("HKDF failed");
+        UserId(user_id)
+    }
+
+    pub fn get_key(&self) -> VerifyingKey {
+        self.0
+    }
+
+    pub fn to_public_key(&self) -> PublicKey {
+        PublicKey::from(self.0.to_montgomery().to_bytes())
+    }
+
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+}
 
 pub trait Header {
     fn get_public_key(&self) -> PublicKey;
