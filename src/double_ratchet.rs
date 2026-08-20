@@ -1,5 +1,5 @@
 use crate::{
-    ChainID, HeaderHash, HeaderKey, KeyHash, MessageKey, RootKey, SessionInit, SessionKeyStore,
+    HeaderHash, HeaderKey, KeyHash, MessageKey, RootKey, SessionInit, SessionKeyStore,
     SessionTag, UserId,
 };
 use crate::{Header as HeaderTrait, Session as SessionTrait};
@@ -12,21 +12,26 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DoubleRatchetError {
     NoSendingChain,
-    NoReceivingChain,
     ChainNotFound,
+    MaxSkipExceeded,
+    InvalidMessageCount,
+    ChainInitFailed
 }
 impl std::fmt::Display for DoubleRatchetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoSendingChain => write!(f, "Uninitialized sending chain"),
-            Self::NoReceivingChain => write!(f, "Uninitialized receiving chain"),
             Self::ChainNotFound => write!(f, "Chain not found"),
+            Self::MaxSkipExceeded => write!(f, "Message count exceeds MAX_SKIP threshold (DoS protection)"),
+            Self::InvalidMessageCount => write!(f, "Invalid message count in header"),
+            Self::ChainInitFailed => write!(f, "Failed chain init"),
         }
     }
 }
 impl std::error::Error for DoubleRatchetError {}
 
 const KEY_LENGTH: usize = 32;
+const MAX_SKIP: u16 = 2000; // Limite massimo di chiavi saltabili (Protezione DoS)
 const SESSION_INFO: &[u8] = b"/freesignal/double_ratchet/v0.1";
 const CHAIN_INFO: &[u8] = b"/freesignal/double_ratchet/keychain/v0.1";
 const SESSION_TAG_INFO: &[u8] = b"/freesignal/double_ratchet/tag/v0.1";
@@ -42,11 +47,13 @@ pub struct Header {
 }
 
 impl HeaderTrait for Header {
+    fn get_public_key(&self) -> PublicKey {
+        self.remote_key
+    }
+
     fn hash(&self) -> HeaderHash {
-        let mut raw = [0u8; 36];
-        raw[..32].copy_from_slice(self.remote_key.as_bytes());
-        raw[32..34].copy_from_slice(&self.count.to_be_bytes());
-        raw[34..].copy_from_slice(&self.previous.to_be_bytes());
+        // CORREZIONE 3: Unificato il layout di hashing con to_bytes()
+        let raw = self.to_bytes();
         Sha256::digest(&raw).into()
     }
 
@@ -83,13 +90,12 @@ pub struct SessionData {
     pub root_key: RootKey,
     pub header_key: Option<HeaderKey>,
     pub next_header_key: Option<HeaderKey>,
-    pub sending_chain: Option<ChainID>,
-    pub receiving_chain: Option<ChainID>,
-    pub prev_keys_count: u16,
+    pub sending_chain: Option<Chain>,
+    pub receiving_chain: Option<Chain>,
 }
 
 #[derive(Zeroize, ZeroizeOnDrop, Clone)]
-pub struct Session<K: SessionKeyStore<SessionData, Chain> + Clone> {
+pub struct Session<K: SessionKeyStore<SessionData>> {
     #[zeroize(skip)]
     pub keystore: K,
     pub user_id: UserId,
@@ -98,83 +104,17 @@ pub struct Session<K: SessionKeyStore<SessionData, Chain> + Clone> {
     previous: Option<SessionData>,
 }
 
-impl<K: SessionKeyStore<SessionData, Chain> + Clone> Session<K> {
-    pub fn has_skipped_keys(&self) -> bool {
-        self.current.prev_keys_count > 0
-    }
-}
-
-impl<K: SessionKeyStore<SessionData, Chain> + Clone>
-    SessionTrait<SessionData, Chain, K, Header, DoubleRatchetError> for Session<K>
-{
-    fn new(init: &SessionInit, keystore: K) -> Session<K> {
-        let mut session_tag = [0u8; KEY_LENGTH];
-        let hkdf = Hkdf::<Sha256>::new(Some(&[0u8; KEY_LENGTH]), init.root_key.0.as_ref());
-        hkdf.expand(SESSION_TAG_INFO, &mut session_tag)
-            .expect("HKDF failed");
-
-        let mut session = Session {
-            keystore,
-            user_id: init.user_id.clone(),
-            session_tag: SessionTag(session_tag),
-            current: SessionData {
-                root_key: init.root_key.clone(),
-                header_key: init.header_key.clone(),
-                next_header_key: init.next_header_key.clone(),
-                secret_key: StaticSecret::random_from_rng(rand_core::OsRng),
-                sending_chain: None,
-                receiving_chain: None,
-                prev_keys_count: 0,
-            },
-            previous: None,
-        };
-
-        session_tag.zeroize();
-
-        if let Some(ref nhk) = init.next_header_key {
-            let hash: [u8; 32] = Sha256::digest(&nhk.0).into();
-            session.keystore.set_header_key(&hash, nhk);
-        }
-
-        if let Some(remote_key) = init.remote_key {
-            session.current.sending_chain = session
-                .init_chain(&remote_key, init.header_key.as_ref(), None)
-                .0;
-            session.current.header_key = None;
-        }
-
-        session
-    }
-
-    fn commit(&mut self) {
-        self.previous = Some(self.current.clone());
-        self.keystore.commit(&self.current);
-    }
-
-    fn rollback(&mut self) -> bool {
-        if self.previous.is_none() {
-            return false;
-        }
-        if self.keystore.rollback() {
-            if let Some(backup) = self.previous.take() {
-                self.current = backup;
-                return true;
-            }
-        }
-        false
-    }
-
+impl<K: SessionKeyStore<SessionData>> Session<K> {
     fn init_chain(
         &mut self,
         remote_key: &PublicKey,
         header_key: Option<&HeaderKey>,
         previous_count: Option<u16>,
-    ) -> (Option<ChainID>, Chain) {
+    ) -> Result<Chain, DoubleRatchetError> {
         let shared_key = self.current.secret_key.diffie_hellman(remote_key);
         let mut hash_key = [0u8; KEY_LENGTH * 3];
         let hkdf = Hkdf::<Sha256>::new(Some(&self.current.root_key.0), shared_key.as_bytes());
-        hkdf.expand(SESSION_INFO, &mut hash_key)
-            .expect("HKDF failed");
+        hkdf.expand(SESSION_INFO, &mut hash_key).map_err(|_| DoubleRatchetError::ChainInitFailed)?;
 
         let mut root_val = [0u8; 32];
         let mut chain_val = [0u8; 32];
@@ -198,35 +138,80 @@ impl<K: SessionKeyStore<SessionData, Chain> + Clone>
             previous_count: previous_count.unwrap_or(0),
         };
 
-        (Some(self.keystore.set_key_chain(None, &chain)), chain)
+        Ok(chain)
+    }
+}
+
+impl<K: SessionKeyStore<SessionData>>
+    SessionTrait<SessionData, K, Header, DoubleRatchetError> for Session<K>
+{
+    fn new(init: &SessionInit, keystore: K) -> Session<K> {
+        let mut session_tag = [0u8; KEY_LENGTH];
+        let hkdf = Hkdf::<Sha256>::new(Some(&[0u8; KEY_LENGTH]), init.root_key.0.as_ref());
+        hkdf.expand(SESSION_TAG_INFO, &mut session_tag)
+            .expect("HKDF failed");
+
+        let mut session = Session {
+            keystore,
+            user_id: init.user_id.clone(),
+            session_tag: SessionTag(session_tag),
+            current: SessionData {
+                root_key: init.root_key.clone(),
+                header_key: init.header_key.clone(),
+                next_header_key: init.next_header_key.clone(),
+                secret_key: StaticSecret::random_from_rng(rand_core::OsRng),
+                sending_chain: None,
+                receiving_chain: None,
+            },
+            previous: None,
+        };
+
+        session_tag.zeroize();
+
+        if let Some(ref nhk) = init.next_header_key {
+            let hash: [u8; 32] = Sha256::digest(&nhk.0).into();
+            session.keystore.set_header_key(&hash, nhk);
+        }
+
+        if let Some(remote_key) = init.remote_key {
+            session.current.sending_chain =
+                Some(session.init_chain(&remote_key, init.header_key.as_ref(), None).unwrap());
+            session.current.header_key = None;
+        }
+
+        session
     }
 
-    fn get_sending_key(&mut self) -> Result<(MessageKey, Header, Option<HeaderKey>), DoubleRatchetError> {
-        let chain_id = self
+    fn commit(&mut self) {
+        self.previous = Some(self.current.clone());
+        self.keystore.set_session_data(&self.current);
+        self.keystore.commit();
+    }
+
+    fn rollback(&mut self) -> bool {
+        if self.previous.is_none() {
+            return false;
+        }
+        if self.keystore.rollback() {
+            if let Some(backup) = self.previous.take() {
+                self.current = backup;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn get_sending_key(
+        &mut self,
+    ) -> Result<(MessageKey, Header, Option<HeaderKey>), DoubleRatchetError> {
+        let chain = self
             .current
-            .sending_chain
+            .sending_chain.as_mut()
             .ok_or(DoubleRatchetError::NoSendingChain)?;
 
-        let mut chain = self
-            .keystore
-            .get_key_chain(chain_id)
-            .ok_or(DoubleRatchetError::ChainNotFound)?;
-
         let msg_key = chain.get_key();
-        self.keystore.set_key_chain(Some(chain_id), &chain);
 
-        let mut header_key: Option<HeaderKey> = None;
-
-        if let Some(hk) = &self.current.header_key {
-            header_key = Some(hk.clone());
-        } else if let Some(hk) = self.current.sending_chain {
-            let sending_chain = self
-                .keystore
-                .get_key_chain(hk)
-                .ok_or(DoubleRatchetError::ChainNotFound)?;
-
-            header_key = sending_chain.header_key.clone();
-        };
+        let header_key: Option<HeaderKey> = self.current.header_key.clone().or(chain.header_key.clone());
 
         Ok((msg_key, chain.get_header(), header_key))
     }
@@ -236,53 +221,61 @@ impl<K: SessionKeyStore<SessionData, Chain> + Clone>
 
         // Skipped Keys Search
         if let Some(key) = self.keystore.get_previous_keys(&kh) {
-            self.current.prev_keys_count = self.current.prev_keys_count.saturating_sub(1);
             return Ok(key);
         }
 
-        let is_new_remote_key = match self.current.receiving_chain {
-            Some(rc_id) => {
-                let rc = self
-                    .keystore
-                    .get_key_chain(rc_id)
-                    .ok_or(DoubleRatchetError::ChainNotFound)?;
-                // Se restituisce 0, le chiavi NON combaciano (sono diverse)
-                rc.remote_key
+        let is_new_remote_key = match &self.current.receiving_chain {
+            Some(chain) => {
+                chain.remote_key
                     .as_bytes()
-                    .ct_eq(header.remote_key.as_bytes())
+                    .ct_eq(header.get_public_key().as_bytes())
                     .unwrap_u8()
                     == 0
             }
             None => true,
         };
 
-        // Diffie-Hellman Ratchet Step
+        // --- CORREZIONE 1 e 2: Validazione PRIMA di mutare lo stato ---
         if is_new_remote_key {
-            let old_receiving_chain = self
-                .current
-                .receiving_chain
-                .and_then(|id| self.keystore.get_key_chain(id));
+            let previous_rc_count = self.current.receiving_chain.as_ref().map_or(0, |c| c.count);
+            if header.previous < previous_rc_count {
+                return Err(DoubleRatchetError::InvalidMessageCount);
+            }
+            if header.previous.saturating_sub(previous_rc_count) > MAX_SKIP {
+                return Err(DoubleRatchetError::MaxSkipExceeded);
+            }
+            // La nuova catena partirà da zero, quindi controlliamo direttamente header.count
+            if header.count > MAX_SKIP {
+                return Err(DoubleRatchetError::MaxSkipExceeded);
+            }
+        } else {
+            let current_rc_count = self.current.receiving_chain.as_ref().map_or(0, |c| c.count);
+            if header.count < current_rc_count {
+                return Err(DoubleRatchetError::ChainNotFound);
+            }
+            if header.count.saturating_sub(current_rc_count) > MAX_SKIP {
+                return Err(DoubleRatchetError::MaxSkipExceeded);
+            }
+        }
 
+        // --- Diffie-Hellman Ratchet Step ---
+        if is_new_remote_key {
+            let old_receiving_chain = self.current.receiving_chain.clone();
             let mut previous_count = old_receiving_chain.as_ref().map(|c| c.count);
+            let mut rc_header_key: Option<HeaderKey> = self.current.next_header_key.clone();
 
-            if let Some(mut rc) = old_receiving_chain.clone() {
+            if let Some(mut rc) = old_receiving_chain {
                 while rc.count < header.previous {
                     let key = rc.get_key();
                     let skipped_hash = rc.get_remote_header().hash();
                     self.keystore.set_previous_keys(&skipped_hash, &key);
-                    self.current.prev_keys_count += 1;
                 }
                 previous_count = Some(rc.count);
-                self.keystore
-                    .del_key_chain(self.current.receiving_chain.unwrap());
+                rc_header_key = rc_header_key.or(rc.header_key.clone())
             }
 
-            let next_hk = old_receiving_chain.map(|c| c.next_header_key.clone());
-            let rc_header_key = self.current.next_header_key.clone().or(next_hk);
-
-            let (new_rc_id, new_rc) =
-                self.init_chain(&header.remote_key, rc_header_key.as_ref(), previous_count);
-            self.current.receiving_chain = new_rc_id;
+            let new_rc = self.init_chain(&header.get_public_key(), rc_header_key.as_ref(), previous_count)?;
+            self.current.receiving_chain = Some(new_rc.clone());
 
             let hash: [u8; 32] = Sha256::digest(&new_rc.next_header_key.0).into();
             self.keystore.set_header_key(&hash, &new_rc.next_header_key);
@@ -293,41 +286,27 @@ impl<K: SessionKeyStore<SessionData, Chain> + Clone>
 
             self.current.secret_key = StaticSecret::random_from_rng(rand_core::OsRng);
 
-            let old_sending_chain_id = self.current.sending_chain;
-            let old_sending_chain =
-                old_sending_chain_id.and_then(|id| self.keystore.get_key_chain(id));
-
+            let old_sending_chain = self.current.sending_chain.clone();
             let sending_chain_count = old_sending_chain.as_ref().map(|c| c.count).unwrap_or(0);
-
             let sc_next_hk = old_sending_chain.map(|c| c.next_header_key.clone());
             let sc_header_key = self.current.header_key.clone().or(sc_next_hk);
 
-            (self.current.sending_chain, _) = self.init_chain(
-                &header.remote_key,
+            self.current.sending_chain = Some(self.init_chain(
+                &header.get_public_key(),
                 sc_header_key.as_ref(),
                 Some(sending_chain_count),
-            );
+            )?);
 
             if self.current.header_key.is_some() {
                 self.current.header_key = None;
             }
-
-            // Pulisci vecchia Sending Chain dal DB
-            if let Some(old_send_id) = old_sending_chain_id {
-                self.keystore.del_key_chain(old_send_id);
-            }
         }
 
-        // Symmetric Ratchet
-        let receiving_chain_id = self
+        // --- Symmetric Ratchet ---
+        let receiving_chain = self
             .current
-            .receiving_chain
-            .ok_or(DoubleRatchetError::NoReceivingChain)?;
-
-        let mut receiving_chain = self
-            .keystore
-            .get_key_chain(receiving_chain_id)
-            .ok_or(DoubleRatchetError::ChainNotFound)?;
+            .receiving_chain.as_mut()
+            .unwrap(); // Sicuro perché l'abbiamo appena istanziata in DH Ratchet, o esisteva già
 
         let mut final_key: Option<MessageKey> = None;
         while receiving_chain.count < header.count {
@@ -337,24 +316,16 @@ impl<K: SessionKeyStore<SessionData, Chain> + Clone>
             } else {
                 let skipped_hash = receiving_chain.get_remote_header().hash();
                 self.keystore.set_previous_keys(&skipped_hash, &key);
-                self.current.prev_keys_count += 1;
             }
         }
 
-        let final_key = final_key.ok_or(DoubleRatchetError::ChainNotFound)?;
-
-        self.keystore
-            .set_key_chain(Some(receiving_chain_id), &receiving_chain);
-
-        Ok(final_key)
+        final_key.ok_or(DoubleRatchetError::ChainNotFound)
     }
 
     fn from_header(hash: &KeyHash, header_bytes: &[u8], keystore: K) -> (Option<HeaderKey>, Self) {
         let is_unencrypted = hash.iter().all(|&b| b == 0);
 
         let (header_key, lookup_hash) = if is_unencrypted {
-            // Se l'header non è cifrato (KeyHash = [0; 32]), l'hash per recuperare i dati di sessione
-            // viene calcolato direttamente dalla chiave pubblica remota presente nei primi byte dell'header in chiaro
             let mut remote_key_bytes = [0u8; 32];
             if header_bytes.len() >= 36 {
                 remote_key_bytes.copy_from_slice(&header_bytes[4..36]);
@@ -365,12 +336,10 @@ impl<K: SessionKeyStore<SessionData, Chain> + Clone>
             let computed_hash: [u8; 32] = Sha256::digest(&remote_key_bytes).into();
             (None, computed_hash)
         } else {
-            // Header cifrato: recupera la HeaderKey dal keystore
             let hk = keystore.get_header_key(hash);
             (hk, *hash)
         };
 
-        // Recupero dei SessionData dallo store, o creazione di uno stato base di fallback
         let session_data = keystore
             .get_session_data(&lookup_hash)
             .unwrap_or_else(|| SessionData {
@@ -380,10 +349,8 @@ impl<K: SessionKeyStore<SessionData, Chain> + Clone>
                 next_header_key: None,
                 sending_chain: None,
                 receiving_chain: None,
-                prev_keys_count: 0,
             });
 
-        // Calcolo del SessionTag per la nuova istanza
         let mut session_tag = [0u8; KEY_LENGTH];
         let hkdf = Hkdf::<Sha256>::new(Some(&[0u8; KEY_LENGTH]), session_data.root_key.0.as_ref());
         hkdf.expand(SESSION_TAG_INFO, &mut session_tag)
@@ -398,6 +365,10 @@ impl<K: SessionKeyStore<SessionData, Chain> + Clone>
         };
 
         (header_key, session)
+    }
+
+    fn has_skipped_keys(&self) -> bool {
+        self.keystore.has_skipped_keys()
     }
 }
 
@@ -456,11 +427,9 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct MemoryKeystore {
-        chains: Rc<RefCell<HashMap<ChainID, Chain>>>,
         header_keys: Rc<RefCell<HashMap<KeyHash, HeaderKey>>>,
         previous_keys: Rc<RefCell<HashMap<HeaderHash, MessageKey>>>,
-        session_data: Rc<RefCell<HashMap<[u8; 32], SessionData>>>,
-        next_chain_id: Rc<RefCell<ChainID>>,
+        session_data: Rc<RefCell<HashMap<[u8; 32], SessionData>>>
     }
 
     impl MemoryKeystore {
@@ -473,26 +442,7 @@ mod tests {
         }
     }
 
-    impl SessionKeyStore<SessionData, Chain> for MemoryKeystore {
-        fn set_key_chain(&self, key: Option<ChainID>, value: &Chain) -> ChainID {
-            let mut chains = self.chains.borrow_mut();
-            let id = key.unwrap_or_else(|| {
-                let mut next_id = self.next_chain_id.borrow_mut();
-                *next_id += 1;
-                *next_id
-            });
-            chains.insert(id, value.clone());
-            id
-        }
-
-        fn get_key_chain(&self, id: ChainID) -> Option<Chain> {
-            self.chains.borrow().get(&id).cloned()
-        }
-
-        fn del_key_chain(&self, id: ChainID) -> bool {
-            self.chains.borrow_mut().remove(&id).is_some()
-        }
-
+    impl SessionKeyStore<SessionData> for MemoryKeystore {
         fn set_header_key(&self, key: &KeyHash, value: &HeaderKey) {
             self.header_keys.borrow_mut().insert(*key, value.clone());
         }
@@ -514,7 +464,14 @@ mod tests {
             true
         }
 
-        fn commit(&self, _session: &SessionData) {}
+        fn has_skipped_keys(&self) -> bool {
+            // Evitiamo borrow_mut() per la semplice lettura
+            self.previous_keys.borrow().len() > 0
+        }
+
+        fn set_session_data(&self, _session: &SessionData) {}
+
+        fn commit(&self) {}
 
         fn rollback(&self) -> bool {
             true

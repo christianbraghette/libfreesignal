@@ -5,7 +5,6 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 mod double_ratchet;
-mod scka;
 mod x3dh;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq, Debug)]
@@ -24,7 +23,6 @@ pub trait KeyExchangeStore {
 
 pub type HeaderHash = [u8; 32];
 pub type KeyHash = [u8; 32];
-pub type ChainID = i64;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
 pub struct SessionTag(pub [u8; 32]);
@@ -36,6 +34,7 @@ pub struct RootKey(pub [u8; 32]);
 pub struct HeaderKey(pub [u8; 32]);
 
 pub trait Header {
+    fn get_public_key(&self) -> PublicKey;
     fn hash(&self) -> HeaderHash;
     fn to_bytes(&self) -> [u8; 36];
     fn from_bytes(bytes: &[u8; 36]) -> Self;
@@ -50,35 +49,25 @@ pub struct SessionInit {
     pub next_header_key: Option<HeaderKey>,
 }
 
-pub trait SessionKeyStore<Data, Chain> {
-    fn set_key_chain(&self, key: Option<ChainID>, value: &Chain) -> ChainID;
-    fn get_key_chain(&self, id: ChainID) -> Option<Chain>;
-    fn del_key_chain(&self, id: ChainID) -> bool;
-    fn get_session_data(&self, hash: &[u8; 32]) -> Option<Data>; //hash of public_key
-    fn set_header_key(&self, key: &KeyHash, value: &HeaderKey);
-    fn get_header_key(&self, key: &KeyHash) -> Option<HeaderKey>;
-    fn set_previous_keys(&self, key: &HeaderHash, value: &MessageKey);
-    fn get_previous_keys(&self, key: &HeaderHash) -> Option<MessageKey>;
+pub trait SessionKeyStore<Data> {
+    fn set_session_data(&self, session: &Data);
+    fn get_session_data(&self, public_key_hash: &KeyHash) -> Option<Data>;
+    fn set_header_key(&self, header_key: &KeyHash, value: &HeaderKey);
+    fn get_header_key(&self, header_key: &KeyHash) -> Option<HeaderKey>;
+    fn set_previous_keys(&self, hash: &HeaderHash, value: &MessageKey);
+    fn get_previous_keys(&self, hash: &HeaderHash) -> Option<MessageKey>;
     fn del_previous_keys(&self) -> bool;
-    fn commit(&self, session: &Data);
+    fn has_skipped_keys(&self) -> bool;
+    fn commit(&self);
     fn rollback(&self) -> bool;
 }
 
-pub trait Session<Data, Chain, K: SessionKeyStore<Data, Chain> + Clone, H: Header, E: Error> {
+pub trait Session<Data, K: SessionKeyStore<Data>, H: Header, E: Error> {
     fn new(init: &SessionInit, keystore: K) -> Self;
     fn commit(&mut self);
     fn rollback(&mut self) -> bool;
-
-    fn init_chain(
-        &mut self,
-        remote_key: &PublicKey,
-        header_key: Option<&HeaderKey>,
-        previous_count: Option<u16>,
-    ) -> (Option<ChainID>, Chain);
-
     fn get_sending_key(&mut self) -> Result<(MessageKey, H, Option<HeaderKey>), E>;
-
     fn get_receiving_key(&mut self, header: &H) -> Result<MessageKey, E>;
-
+    fn has_skipped_keys(&self) -> bool;
     fn from_header(hash: &KeyHash, header: &[u8], keystore: K) -> (Option<HeaderKey>, Self);
 }
