@@ -50,8 +50,9 @@ pub struct SessionInit {
 }
 
 pub trait SessionKeyStore<Data> {
-    fn set_session_data(&self, session: &Data);
-    fn get_session_data(&self, public_key_hash: &KeyHash) -> Option<Data>;
+    fn get_tag(&self) -> SessionTag;
+    fn set_data(&self, session: &Data);
+    fn get_data(&self, public_key_hash: &KeyHash) -> Option<Data>;
     fn set_header_key(&self, header_key: &KeyHash, value: &HeaderKey);
     fn get_header_key(&self, header_key: &KeyHash) -> Option<HeaderKey>;
     fn set_previous_keys(&self, hash: &HeaderHash, value: &MessageKey);

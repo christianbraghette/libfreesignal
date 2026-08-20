@@ -380,14 +380,18 @@ mod tests {
             !self.previous_keys.borrow().is_empty()
         }
 
-        fn set_session_data(&self, _session: &SessionData) {}
+        fn set_data(&self, _session: &SessionData) {}
         fn commit(&self) {}
         fn rollback(&self) -> bool {
             true
         }
 
-        fn get_session_data(&self, hash: &[u8; 32]) -> Option<SessionData> {
+        fn get_data(&self, hash: &[u8; 32]) -> Option<SessionData> {
             self.session_data.borrow().get(hash).cloned()
+        }
+        
+        fn get_tag(&self) -> crate::SessionTag {
+            todo!()
         }
     }
 

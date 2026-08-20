@@ -185,7 +185,7 @@ impl<K: SessionKeyStore<SessionData>>
 
     fn commit(&mut self) {
         self.previous = Some(self.current.clone());
-        self.keystore.set_session_data(&self.current);
+        self.keystore.set_data(&self.current);
         self.keystore.commit();
     }
 
@@ -338,7 +338,7 @@ impl<K: SessionKeyStore<SessionData>>
         };
 
         let session_data = keystore
-            .get_session_data(&lookup_hash)
+            .get_data(&lookup_hash)
             .unwrap_or_else(|| SessionData {
                 secret_key: StaticSecret::random_from_rng(rand_core::OsRng),
                 root_key: RootKey([0u8; 32]),
@@ -464,14 +464,18 @@ mod tests {
             !self.previous_keys.borrow().is_empty()
         }
 
-        fn set_session_data(&self, _session: &SessionData) {}
+        fn set_data(&self, _session: &SessionData) {}
         fn commit(&self) {}
         fn rollback(&self) -> bool {
             true
         }
 
-        fn get_session_data(&self, hash: &[u8; 32]) -> Option<SessionData> {
+        fn get_data(&self, hash: &[u8; 32]) -> Option<SessionData> {
             self.session_data.borrow().get(hash).cloned()
+        }
+        
+        fn get_tag(&self) -> SessionTag {
+            todo!()
         }
     }
 
