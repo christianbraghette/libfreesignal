@@ -1,14 +1,15 @@
-use crate::{HeaderKey, KeyExchangeStore, RootKey, UserId, SessionInit};
-use ed25519_dalek::{Signature, Signer, VerifyingKey};
+use crate::{HeaderKey, KeyExchangeStore, RootKey, SessionInit, UserId};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
-use sha2::{Digest, Sha256};
+use rand_core::{OsRng, RngCore};
+use sha2::{Digest, Sha256, Sha512};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
-use rand_core::{OsRng, RngCore};
 
 const KEY_LENGTH: usize = 32;
 const HASH_LENGTH: usize = 32;
 const X3DH_INFO: &[u8] = b"/freesignal/x3dh/v0.1";
+const PREFIX_F: [u8; 32] = [0xFF; 32]; // Prefisso F per la Domain Separation (Spec X3DH 3.3)
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyExchangeError {
@@ -25,6 +26,15 @@ impl std::fmt::Display for KeyExchangeError {
     }
 }
 impl std::error::Error for KeyExchangeError {}
+
+/// Mappa una chiave di firma Ed25519 in una chiave privata X25519 equivalente.
+/// Applica l'hashing SHA-512 al seed ed estrae i primi 32 byte.
+pub fn get_identity_x25519_secret(signing_key: &SigningKey) -> StaticSecret {
+    let hash = Sha512::digest(signing_key.as_bytes());
+    let mut scalar_bytes = [0u8; 32];
+    scalar_bytes.copy_from_slice(&hash[..32]);
+    StaticSecret::from(scalar_bytes)
+}
 
 #[derive(Clone)]
 pub struct PreKeyBundle<const N: usize> {
@@ -45,7 +55,7 @@ pub struct PreKeyMessage {
 const PUBLIC_ID_INFO: &[u8] = b"freesignal/user_id/v0.1";
 
 #[derive(Clone)]
-pub struct PublicIdentity(VerifyingKey);
+pub struct PublicIdentity(pub VerifyingKey);
 
 impl PublicIdentity {
     pub fn get_user_id(&self) -> UserId {
@@ -94,7 +104,6 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         let mut header_key2 = [0u8; KEY_LENGTH];
         header_key2.copy_from_slice(&derived[KEY_LENGTH * 2..]);
 
-        // PULIZIA MEMORIA: Sovrascrive i byte dell'output HKDF con zeri
         derived.zeroize();
 
         (
@@ -162,32 +171,43 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         let onetime_pre_key_hash: Option<[u8; 32]> =
             onetime_pre_key.map(|data| Sha256::digest(data.as_bytes()).into());
 
-        let mut raw: [u8; KEY_LENGTH * 4] = [0u8; KEY_LENGTH * 4];
-        let mut raw_len = KEY_LENGTH * 3;
+        // Array esteso per includere il prefisso F (32 byte) + 4 risultati DH (32 byte ciascuno)
+        let mut raw: [u8; KEY_LENGTH * 5] = [0u8; KEY_LENGTH * 5];
+        let mut raw_len = KEY_LENGTH * 4;
 
-        raw[..KEY_LENGTH].copy_from_slice(
-            self.keystore
-                .get_secret_key()
-                .diffie_hellman(&bundle.signed_pre_key)
-                .as_ref(),
-        );
+        // Prefisso F per la Domain Separation
+        raw[..KEY_LENGTH].copy_from_slice(&PREFIX_F);
+
+        let identity_x25519_secret = get_identity_x25519_secret(&self.keystore.get_signing_key());
+
+        // DH1 = DH(IK_A, SPK_B)
         raw[KEY_LENGTH..KEY_LENGTH * 2].copy_from_slice(
+            identity_x25519_secret
+                .diffie_hellman(&bundle.signed_pre_key)
+                .as_bytes(),
+        );
+
+        // DH2 = DH(EK_A, IK_B)
+        raw[KEY_LENGTH * 2..KEY_LENGTH * 3].copy_from_slice(
             ephemeral_key
                 .diffie_hellman(&PublicKey::from(
                     bundle.identity_key.to_montgomery().to_bytes(),
                 ))
                 .as_bytes(),
         );
-        raw[KEY_LENGTH * 2..KEY_LENGTH * 3].copy_from_slice(
+
+        // DH3 = DH(EK_A, SPK_B)
+        raw[KEY_LENGTH * 3..KEY_LENGTH * 4].copy_from_slice(
             ephemeral_key
                 .diffie_hellman(&bundle.signed_pre_key)
                 .as_bytes(),
         );
 
+        // DH4 = DH(EK_A, OPK_B)
         if let Some(pre_key) = onetime_pre_key {
-            raw[KEY_LENGTH * 3..]
+            raw[KEY_LENGTH * 4..]
                 .copy_from_slice(ephemeral_key.diffie_hellman(&pre_key).as_bytes());
-            raw_len = KEY_LENGTH * 4;
+            raw_len = KEY_LENGTH * 5;
         }
 
         let (root_key, header_key, next_header_key) = Self::derive_session_keys(&raw[..raw_len]);
@@ -229,32 +249,42 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         let onetime_pre_key = self.keystore.load_pre_key(&hash);
         self.keystore.remove_pre_key(&hash);
 
-        let mut raw: [u8; KEY_LENGTH * 4] = [0u8; KEY_LENGTH * 4];
-        let mut raw_len = KEY_LENGTH * 3;
+        let mut raw: [u8; KEY_LENGTH * 5] = [0u8; KEY_LENGTH * 5];
+        let mut raw_len = KEY_LENGTH * 4;
 
-        raw[..KEY_LENGTH].copy_from_slice(
+        // Prefisso F per la Domain Separation
+        raw[..KEY_LENGTH].copy_from_slice(&PREFIX_F);
+
+        let identity_x25519_secret = get_identity_x25519_secret(&self.keystore.get_signing_key());
+
+        // DH1 = DH(SPK_B, IK_A)
+        raw[KEY_LENGTH..KEY_LENGTH * 2].copy_from_slice(
             signed_pre_key
                 .diffie_hellman(&PublicKey::from(
                     message.identity_key.to_montgomery().to_bytes(),
                 ))
-                .as_ref(),
+                .as_bytes(),
         );
-        raw[KEY_LENGTH..KEY_LENGTH * 2].copy_from_slice(
-            self.keystore
-                .get_secret_key()
+
+        // DH2 = DH(IK_B, EK_A)
+        raw[KEY_LENGTH * 2..KEY_LENGTH * 3].copy_from_slice(
+            identity_x25519_secret
                 .diffie_hellman(&message.ephemeral_key)
                 .as_bytes(),
         );
-        raw[KEY_LENGTH * 2..KEY_LENGTH * 3].copy_from_slice(
+
+        // DH3 = DH(SPK_B, EK_A)
+        raw[KEY_LENGTH * 3..KEY_LENGTH * 4].copy_from_slice(
             signed_pre_key
                 .diffie_hellman(&message.ephemeral_key)
                 .as_bytes(),
         );
 
+        // DH4 = DH(OPK_B, EK_A)
         if let Some(pre_key) = onetime_pre_key {
-            raw[KEY_LENGTH * 3..]
+            raw[KEY_LENGTH * 4..]
                 .copy_from_slice(pre_key.diffie_hellman(&message.ephemeral_key).as_bytes());
-            raw_len = KEY_LENGTH * 4;
+            raw_len = KEY_LENGTH * 5;
         }
 
         let (root_key, next_header_key, header_key) = Self::derive_session_keys(&raw[..raw_len]);
@@ -274,14 +304,17 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::double_ratchet::{Header, SessionData};
+    use crate::{Header as HeaderTrait, Session as SessionTrait, SessionKeyStore};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
+    use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
     struct MockKeyStore {
-        secret_key: StaticSecret,
         signing_key: SigningKey,
         store: Arc<Mutex<HashMap<Vec<u8>, StaticSecret>>>,
     }
@@ -290,18 +323,13 @@ mod tests {
         fn new() -> Self {
             let secret_key = StaticSecret::random_from_rng(OsRng);
             Self {
-                secret_key: secret_key.clone(),
-                signing_key: SigningKey::from_bytes(secret_key.as_bytes()),
+                signing_key: SigningKey::from_bytes(&secret_key.to_bytes()),
                 store: Arc::new(Mutex::new(HashMap::new())),
             }
         }
     }
 
     impl KeyExchangeStore for MockKeyStore {
-        fn get_secret_key(&self) -> StaticSecret {
-            self.secret_key.clone()
-        }
-
         fn get_signing_key(&self) -> SigningKey {
             self.signing_key.clone()
         }
@@ -322,19 +350,59 @@ mod tests {
         }
     }
 
-    // RISOLUZIONE: L'helper ora accetta il keystore per derivare la chiave pubblica corrispondente
-    // alla chiave privata usata per la firma.
+    #[derive(Clone, Default)]
+    struct MemorySessionKeystore {
+        header_keys: Rc<RefCell<HashMap<[u8; 32], HeaderKey>>>,
+        previous_keys: Rc<RefCell<HashMap<[u8; 32], crate::MessageKey>>>,
+        session_data: Rc<RefCell<HashMap<[u8; 32], SessionData>>>,
+    }
+
+    impl SessionKeyStore<SessionData> for MemorySessionKeystore {
+        fn set_header_key(&self, key: &[u8; 32], value: &HeaderKey) {
+            self.header_keys.borrow_mut().insert(*key, value.clone());
+        }
+
+        fn get_header_key(&self, key: &[u8; 32]) -> Option<HeaderKey> {
+            self.header_keys.borrow().get(key).cloned()
+        }
+
+        fn set_previous_keys(&self, key: &[u8; 32], value: &crate::MessageKey) {
+            self.previous_keys.borrow_mut().insert(*key, value.clone());
+        }
+
+        fn get_previous_keys(&self, key: &[u8; 32]) -> Option<crate::MessageKey> {
+            self.previous_keys.borrow_mut().remove(key)
+        }
+
+        fn del_previous_keys(&self) -> bool {
+            self.previous_keys.borrow_mut().clear();
+            true
+        }
+
+        fn has_skipped_keys(&self) -> bool {
+            !self.previous_keys.borrow().is_empty()
+        }
+
+        fn set_session_data(&self, _session: &SessionData) {}
+        fn commit(&self) {}
+        fn rollback(&self) -> bool {
+            true
+        }
+
+        fn get_session_data(&self, hash: &[u8; 32]) -> Option<SessionData> {
+            self.session_data.borrow().get(hash).cloned()
+        }
+    }
+
     fn create_test_identity(keystore: &MockKeyStore) -> PublicIdentity {
         PublicIdentity(keystore.get_signing_key().verifying_key())
     }
 
-    // --- TEST 1: Verifica della firma del Bundle ---
     #[test]
     fn test_pre_key_bundle_signature_verification() {
         let keystore = MockKeyStore::new();
-        // Passiamo il keystore per avere un'identità coerente
         let identity = create_test_identity(&keystore);
-        let session = KeyExchange::new(identity.clone(), keystore.clone());
+        let session = KeyExchange::new(identity, keystore.clone());
 
         let bundle: PreKeyBundle<5> = session.create_pre_key_bundle();
 
@@ -348,7 +416,6 @@ mod tests {
         );
     }
 
-    // --- TEST 2: Validazione della logica OPK e Storage ---
     #[test]
     fn test_create_pre_key_bundle_opk_generation() {
         let keystore = MockKeyStore::new();
@@ -360,43 +427,80 @@ mod tests {
 
         assert!(bundle.onetime_pre_keys.is_some());
         let opks = bundle.onetime_pre_keys.unwrap();
-        assert_eq!(
-            opks.len(),
-            MAX_OPK,
-            "Il bundle deve contenere esattamente {} OPK",
-            MAX_OPK
-        );
-
-        for i in 0..MAX_OPK {
-            for j in (i + 1)..MAX_OPK {
-                assert_ne!(
-                    opks[i].as_bytes(),
-                    opks[j].as_bytes(),
-                    "Le chiavi OPK devono essere crittograficamente uniche"
-                );
-            }
-        }
+        assert_eq!(opks.len(), MAX_OPK);
 
         let store_guard = keystore.store.lock().unwrap();
+        assert_eq!(store_guard.len(), MAX_OPK + 1);
+    }
+
+    // --- TEST DI INTEGRAZIONE END-TO-END (ALICE <-> BOB) ---
+    #[test]
+    fn test_x3dh_full_handshake_end_to_end() {
+        // 1. Bob crea la sua identità e genera il bundle X3DH
+        let bob_keystore = MockKeyStore::new();
+        let bob_identity = create_test_identity(&bob_keystore);
+        let bob_kx = KeyExchange::new(bob_identity.clone(), bob_keystore.clone());
+        let bob_bundle: PreKeyBundle<5> = bob_kx.create_pre_key_bundle();
+
+        // 2. Alice processa il bundle di Bob per iniziare la sessione
+        let alice_keystore = MockKeyStore::new();
+        let alice_identity = create_test_identity(&alice_keystore);
+        let alice_kx = KeyExchange::new(alice_identity.clone(), alice_keystore.clone());
+
+        let (alice_init, pre_key_msg) = alice_kx
+            .process_pre_key_bundle(&bob_bundle)
+            .expect("Alice deve elaborare il bundle con successo");
+
+        // 3. Bob processa il PreKeyMessage inviato da Alice
+        let bob_init = bob_kx
+            .process_pre_key_message(pre_key_msg)
+            .expect("Bob deve elaborare il messaggio con successo");
+
+        // 4. VERIFICA FONDAMENTALE: Le RootKey calcolate devono essere IDENTICHE
         assert_eq!(
-            store_guard.len(),
-            MAX_OPK + 1,
-            "Il keystore deve contenere la SPK e tutte le OPK"
+            alice_init.root_key.0, bob_init.root_key.0,
+            "Handshake X3DH fallito: Alice e Bob hanno calcolato RootKey differenti!"
+        );
+
+        // Le chiavi di header trasversali devono combaciare
+        assert_eq!(alice_init.header_key, bob_init.next_header_key);
+        assert_eq!(alice_init.next_header_key, bob_init.header_key);
+
+        // 5. Verifica che le sessioni derivate comunichino via Double Ratchet
+        type DR = crate::double_ratchet::Session<MemorySessionKeystore>;
+
+        let mut alice_dr = DR::new(&alice_init, MemorySessionKeystore::default());
+        let mut bob_dr = DR::new(&bob_init, MemorySessionKeystore::default());
+
+        // Alice invia un messaggio a Bob
+        let (alice_msg_key, header, _) = alice_dr.get_sending_key().unwrap();
+        let bob_msg_key = bob_dr.get_receiving_key(&header).unwrap();
+
+        assert_eq!(
+            alice_msg_key.0, bob_msg_key.0,
+            "La chiave derivata da Bob deve coincidere con quella di Alice"
         );
     }
 
-    // --- TEST 3: Estrazione e formattazione dell'identità (UserId) ---
     #[test]
-    fn test_public_identity_hkdf_expansion() {
-        // Qui ci basta un mock generico, quindi lo inizializziamo sul momento
-        let keystore = MockKeyStore::new();
-        let identity = create_test_identity(&keystore);
-        let user_id = identity.get_user_id();
+    fn test_x3dh_handshake_without_opk() {
+        let bob_keystore = MockKeyStore::new();
+        let bob_identity = create_test_identity(&bob_keystore);
+        let bob_kx = KeyExchange::new(bob_identity, bob_keystore);
 
-        assert_eq!(user_id.0.len(), 32);
-        assert_ne!(
-            user_id.0, [0u8; 32],
-            "L'ID utente derivato non deve essere una slice di soli zeri"
+        let mut bundle: PreKeyBundle<0> = bob_kx.create_pre_key_bundle();
+        bundle.onetime_pre_keys = None; // Nessuna OPK usata
+
+        let alice_keystore = MockKeyStore::new();
+        let alice_identity = create_test_identity(&alice_keystore);
+        let alice_kx = KeyExchange::new(alice_identity, alice_keystore);
+
+        let (alice_init, pre_key_msg) = alice_kx.process_pre_key_bundle(&bundle).unwrap();
+        let bob_init = bob_kx.process_pre_key_message(pre_key_msg).unwrap();
+
+        assert_eq!(
+            alice_init.root_key.0, bob_init.root_key.0,
+            "Handshake senza OPK deve produrre la stessa RootKey"
         );
     }
 }

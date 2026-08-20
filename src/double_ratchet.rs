@@ -15,7 +15,7 @@ pub enum DoubleRatchetError {
     ChainNotFound,
     MaxSkipExceeded,
     InvalidMessageCount,
-    ChainInitFailed
+    ChainInitFailed,
 }
 impl std::fmt::Display for DoubleRatchetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -31,7 +31,7 @@ impl std::fmt::Display for DoubleRatchetError {
 impl std::error::Error for DoubleRatchetError {}
 
 const KEY_LENGTH: usize = 32;
-const MAX_SKIP: u16 = 2000; // Limite massimo di chiavi saltabili (Protezione DoS)
+const MAX_SKIP: u16 = 2000;
 const SESSION_INFO: &[u8] = b"/freesignal/double_ratchet/v0.1";
 const CHAIN_INFO: &[u8] = b"/freesignal/double_ratchet/keychain/v0.1";
 const SESSION_TAG_INFO: &[u8] = b"/freesignal/double_ratchet/tag/v0.1";
@@ -52,18 +52,15 @@ impl HeaderTrait for Header {
     }
 
     fn hash(&self) -> HeaderHash {
-        // CORREZIONE 3: Unificato il layout di hashing con to_bytes()
         let raw = self.to_bytes();
         Sha256::digest(&raw).into()
     }
 
     fn to_bytes(&self) -> [u8; 36] {
         let mut raw = [0u8; 36];
-
         raw[..2].copy_from_slice(&self.count.to_be_bytes());
         raw[2..4].copy_from_slice(&self.previous.to_be_bytes());
         raw[4..].copy_from_slice(self.remote_key.as_bytes());
-
         raw
     }
 
@@ -114,7 +111,8 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
         let shared_key = self.current.secret_key.diffie_hellman(remote_key);
         let mut hash_key = [0u8; KEY_LENGTH * 3];
         let hkdf = Hkdf::<Sha256>::new(Some(&self.current.root_key.0), shared_key.as_bytes());
-        hkdf.expand(SESSION_INFO, &mut hash_key).map_err(|_| DoubleRatchetError::ChainInitFailed)?;
+        hkdf.expand(SESSION_INFO, &mut hash_key)
+            .map_err(|_| DoubleRatchetError::ChainInitFailed)?;
 
         let mut root_val = [0u8; 32];
         let mut chain_val = [0u8; 32];
@@ -206,12 +204,14 @@ impl<K: SessionKeyStore<SessionData>>
     ) -> Result<(MessageKey, Header, Option<HeaderKey>), DoubleRatchetError> {
         let chain = self
             .current
-            .sending_chain.as_mut()
+            .sending_chain
+            .as_mut()
             .ok_or(DoubleRatchetError::NoSendingChain)?;
 
         let msg_key = chain.get_key();
 
-        let header_key: Option<HeaderKey> = self.current.header_key.clone().or(chain.header_key.clone());
+        let header_key: Option<HeaderKey> =
+            self.current.header_key.clone().or(chain.header_key.clone());
 
         Ok((msg_key, chain.get_header(), header_key))
     }
@@ -219,14 +219,14 @@ impl<K: SessionKeyStore<SessionData>>
     fn get_receiving_key(&mut self, header: &Header) -> Result<MessageKey, DoubleRatchetError> {
         let kh = header.hash();
 
-        // Skipped Keys Search
         if let Some(key) = self.keystore.get_previous_keys(&kh) {
             return Ok(key);
         }
 
         let is_new_remote_key = match &self.current.receiving_chain {
             Some(chain) => {
-                chain.remote_key
+                chain
+                    .remote_key
                     .as_bytes()
                     .ct_eq(header.get_public_key().as_bytes())
                     .unwrap_u8()
@@ -235,7 +235,6 @@ impl<K: SessionKeyStore<SessionData>>
             None => true,
         };
 
-        // --- CORREZIONE 1 e 2: Validazione PRIMA di mutare lo stato ---
         if is_new_remote_key {
             let previous_rc_count = self.current.receiving_chain.as_ref().map_or(0, |c| c.count);
             if header.previous < previous_rc_count {
@@ -244,7 +243,6 @@ impl<K: SessionKeyStore<SessionData>>
             if header.previous.saturating_sub(previous_rc_count) > MAX_SKIP {
                 return Err(DoubleRatchetError::MaxSkipExceeded);
             }
-            // La nuova catena partirà da zero, quindi controlliamo direttamente header.count
             if header.count > MAX_SKIP {
                 return Err(DoubleRatchetError::MaxSkipExceeded);
             }
@@ -258,7 +256,6 @@ impl<K: SessionKeyStore<SessionData>>
             }
         }
 
-        // --- Diffie-Hellman Ratchet Step ---
         if is_new_remote_key {
             let old_receiving_chain = self.current.receiving_chain.clone();
             let mut previous_count = old_receiving_chain.as_ref().map(|c| c.count);
@@ -274,7 +271,8 @@ impl<K: SessionKeyStore<SessionData>>
                 rc_header_key = rc_header_key.or(rc.header_key.clone())
             }
 
-            let new_rc = self.init_chain(&header.get_public_key(), rc_header_key.as_ref(), previous_count)?;
+            let new_rc =
+                self.init_chain(&header.get_public_key(), rc_header_key.as_ref(), previous_count)?;
             self.current.receiving_chain = Some(new_rc.clone());
 
             let hash: [u8; 32] = Sha256::digest(&new_rc.next_header_key.0).into();
@@ -302,11 +300,7 @@ impl<K: SessionKeyStore<SessionData>>
             }
         }
 
-        // --- Symmetric Ratchet ---
-        let receiving_chain = self
-            .current
-            .receiving_chain.as_mut()
-            .unwrap(); // Sicuro perché l'abbiamo appena istanziata in DH Ratchet, o esisteva già
+        let receiving_chain = self.current.receiving_chain.as_mut().unwrap();
 
         let mut final_key: Option<MessageKey> = None;
         while receiving_chain.count < header.count {
@@ -393,6 +387,9 @@ impl Chain {
         let mut msg_key = [0u8; 32];
         msg_key.copy_from_slice(&hash_key[32..64]);
 
+        // Pulizia esplicita dello stack
+        hash_key.zeroize();
+
         self.count += 1;
         MessageKey(msg_key)
     }
@@ -416,14 +413,11 @@ impl Chain {
 
 #[cfg(test)]
 mod tests {
-    use crate::HeaderHash;
-
     use super::*;
+    use crate::HeaderHash;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
-
-    // --- 1. MOCK DEL KEYSTORE IN MEMORIA PER I TEST ---
 
     #[derive(Clone, Default)]
     struct MemoryKeystore {
@@ -465,14 +459,11 @@ mod tests {
         }
 
         fn has_skipped_keys(&self) -> bool {
-            // Evitiamo borrow_mut() per la semplice lettura
-            self.previous_keys.borrow().len() > 0
+            !self.previous_keys.borrow().is_empty()
         }
 
         fn set_session_data(&self, _session: &SessionData) {}
-
         fn commit(&self) {}
-
         fn rollback(&self) -> bool {
             true
         }
@@ -581,7 +572,7 @@ mod tests {
     fn test_skipped_key_is_single_use() {
         let shared_root_key = RootKey([7u8; 32]);
 
-        let bob_keystore = MemoryKeystore::new();
+        let bob_keystore = MemoryKeystore::default();
         let bob_init = SessionInit {
             user_id: UserId(Sha256::digest("bob").into()),
             remote_key: None,
@@ -592,7 +583,7 @@ mod tests {
         let mut bob_session = Session::new(&bob_init, bob_keystore);
         let bob_public_key = PublicKey::from(&bob_session.current.secret_key);
 
-        let alice_keystore = MemoryKeystore::new();
+        let alice_keystore = MemoryKeystore::default();
         let alice_init = SessionInit {
             user_id: UserId(Sha256::digest("alice").into()),
             remote_key: Some(bob_public_key),
@@ -602,8 +593,6 @@ mod tests {
         };
         let mut alice_session = Session::new(&alice_init, alice_keystore);
 
-        // Alice invia due messaggi, ma Bob riceve prima il secondo (il primo
-        // viene "saltato" e la sua chiave finisce tra le previous_keys).
         let (_alice_key_1, header_1, _) = alice_session.get_sending_key().unwrap();
         let (alice_key_2, header_2, _) = alice_session.get_sending_key().unwrap();
 
@@ -611,16 +600,13 @@ mod tests {
         assert_eq!(alice_key_2.0, bob_key_2.0);
         assert!(bob_session.has_skipped_keys());
 
-        // Ora arriva il messaggio 1 (saltato): deve decifrare correttamente...
         let bob_key_1_first = bob_session.get_receiving_key(&header_1).unwrap();
         assert!(!bob_session.has_skipped_keys());
 
-        // ...ma se arrivasse una seconda volta (replay), non deve più trovare
-        // la chiave nello store: deve fallire, non restituire di nuovo la stessa.
         let bob_key_1_second = bob_session.get_receiving_key(&header_1);
         assert!(
             bob_key_1_second.is_err(),
-            "la chiave del messaggio saltato è stata riletta due volte: non è single-use"
+            "La chiave del messaggio saltato deve essere usata una sola volta"
         );
         let _ = bob_key_1_first;
     }

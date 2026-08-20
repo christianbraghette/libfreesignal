@@ -14,7 +14,6 @@ pub struct UserId(pub [u8; 32]);
 pub struct MessageKey(pub [u8; 32]);
 
 pub trait KeyExchangeStore {
-    fn get_secret_key(&self) -> StaticSecret;
     fn get_signing_key(&self) -> SigningKey;
     fn store_pre_key(&self, prekey_hash: &[u8], prekey: &StaticSecret);
     fn load_pre_key(&self, prekey_hash: &[u8]) -> Option<StaticSecret>;
