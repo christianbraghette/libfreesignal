@@ -117,14 +117,26 @@ impl MessageKey {
             return Err(MessageEncryptionError());
         }
 
-        // Cerchiamo a ritroso il primo byte non zero (il delimitatore 0x80)
-        if let Some(pos) = padded.iter().rposition(|&b| b != 0x00) {
-            if padded[pos] == 0x80 {
-                return Ok(padded[..pos].to_vec());
-            }
+        let mut pad_len = 0;
+        let mut found = 0u8;
+        
+        for (i, &b) in padded.iter().rev().enumerate() {
+            let is_delimiter = (b == 0x80) as u8;
+            let is_valid_so_far = (found == 0) as u8;
+            
+            let update_mask = is_delimiter & is_valid_so_far;
+            pad_len = (pad_len * (1 - update_mask)) + ((i as u8 + 1) * update_mask);
+            
+            let is_not_zero = (b != 0x00) as u8;
+            found = found | is_not_zero;
         }
 
-        Err(MessageEncryptionError())
+        if pad_len == 0 {
+            return Err(MessageEncryptionError());
+        }
+
+        let original_len = padded.len() - (pad_len as usize);
+        Ok(padded[..original_len].to_vec())
     }
 
     pub fn encrypt_padded_payload(

@@ -210,6 +210,8 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
             .load_pre_key(&message.signed_pre_key_hash)
             .ok_or(KeyExchangeError::PreKeyNotFound)?;
 
+        let mut opk_to_delete: Option<[u8; HASH_LENGTH * 2]> = None;
+
         let onetime_pre_key = if let Some(opk_hash) = message.onetime_pre_key_hash {
             let mut hash = [0u8; HASH_LENGTH * 2];
             hash[..KEY_LENGTH].copy_from_slice(&message.signed_pre_key_hash);
@@ -219,7 +221,9 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
                 .keystore
                 .load_pre_key(&hash)
                 .ok_or(KeyExchangeError::PreKeyNotFound)?;
-            self.keystore.remove_pre_key(&hash);
+            
+            // Invece di eliminarla subito, salviamo l'hash
+            opk_to_delete = Some(hash);
             Some(key)
         } else {
             None
@@ -262,8 +266,12 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 
         raw.zeroize();
 
+        if let Some(hash) = opk_to_delete {
+            self.keystore.remove_pre_key(&hash);
+        }
+
         Ok(SessionInit {
-            user_id: remote_user_id, // Associa il UserId di Alice a SessionInit
+            user_id: remote_user_id,
             remote_key: None,
             secret_key: Some(signed_pre_key),
             root_key,
