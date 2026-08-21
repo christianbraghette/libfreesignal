@@ -49,90 +49,33 @@ pub struct SessionHeader {
     pub remote_key: PublicKey,
 }
 
-impl Header for SessionHeader {
+impl Header<36> for SessionHeader {
     fn get_public_key(&self) -> PublicKey {
         self.remote_key
     }
 
-    /// Payload: [ PublicKeyHash (32b) | Nonce (12b) | Ciphertext (36b) | Tag (16b) ] (96b)
-    fn encrypt(&self, header_key: &HeaderKey) -> Result<[u8; 96], HeaderEncryptionError> {
-        let key = Key::<Aes256Gcm>::from_slice(&header_key.0);
-        let cipher = Aes256Gcm::new(key);
-
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-
-        let raw_bytes = self.to_bytes();
-
-        let ciphertext = cipher
-            .encrypt(&nonce, raw_bytes.as_ref())
-            .map_err(|_| HeaderEncryptionError())?;
-
-        let hash_key: [u8; 32] = Sha256::digest(self.remote_key.as_bytes()).into();
-
-        let mut output = [0u8; 96];
-        output[..32].copy_from_slice(&hash_key);
-        output[32..46].copy_from_slice(&nonce);
-        output[32] = output[32] | 0x80;
-        output[46..].copy_from_slice(&ciphertext);
-
-        Ok(output)
-    }
-
-    /// Payload: [ PublicKeyHash (32b) | Nonce (12b) | Ciphertext (36b) | Tag (16b) ] (96b)
-    fn decrypt<K: HeaderKeyStore>(
-        encrypted_bytes: &[u8; 96],
-        keystore: &K,
-    ) -> Result<SessionHeader, HeaderEncryptionError> {
-        if encrypted_bytes.len() != 96 && (encrypted_bytes[32] & 0x80) == 0 {
-            return Err(HeaderEncryptionError());
-        }
-
-        let mut hash_key = [0u8; 32];
-        hash_key.copy_from_slice(&encrypted_bytes[..32]);
-
-        let header_key = keystore
-            .get_header_key(&hash_key)
-            .ok_or(HeaderEncryptionError())?;
-
-        let nonce = Nonce::from_slice(&encrypted_bytes[32..46]);
-        let ciphertext_with_tag = &encrypted_bytes[46..];
-
-        let key = Key::<Aes256Gcm>::from_slice(&header_key.0);
-        let cipher = Aes256Gcm::new(key);
-
-        let plaintext = cipher
-            .decrypt(nonce, ciphertext_with_tag)
-            .map_err(|_| HeaderEncryptionError())?;
-
-        if plaintext.len() != 36 {
-            return Err(HeaderEncryptionError());
-        }
-
-        let mut raw = [0u8; 68];
-        raw[..32].copy_from_slice(&hash_key);
-        raw[32..].copy_from_slice(&plaintext);
-
-        Ok(Self::from_bytes(&raw))
-    }
-
-    fn to_bytes(&self) -> [u8; 68] {
-        let mut raw = [0u8; 68];
-        raw[..32].copy_from_slice(&Sha256::digest(self.remote_key.as_bytes()));
-        raw[32..34].copy_from_slice(&self.count.to_be_bytes());
-        raw[34..36].copy_from_slice(&self.previous.to_be_bytes());
-        raw[36..].copy_from_slice(self.remote_key.as_bytes());
+    fn to_bytes(&self) -> [u8; 36] {
+        let mut raw = [0u8; 36];
+        raw[0..2].copy_from_slice(&self.count.to_be_bytes());
+        raw[2..4].copy_from_slice(&self.previous.to_be_bytes());
+        raw[4..36].copy_from_slice(self.remote_key.as_bytes());
         raw
     }
 
-    fn from_bytes(bytes: &[u8; 68]) -> Self {
+    fn from_bytes(bytes: &[u8; 36]) -> Self {
+        if bytes.len() == 36 {
+
+        }
+
         let mut count = [0u8; 2];
-        count.copy_from_slice(&bytes[..2]);
+        count.copy_from_slice(&bytes[0..2]);
 
         let mut previous = [0u8; 2];
         previous.copy_from_slice(&bytes[2..4]);
 
         let mut remote_key = [0u8; 32];
-        remote_key.copy_from_slice(&bytes[4..]);
+        remote_key.copy_from_slice(&bytes[4..36]);
+
         Self {
             count: i16::from_be_bytes(count) & 0x7FFF,
             previous: i16::from_be_bytes(previous),
@@ -358,6 +301,10 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
         false
     }
 
+    pub fn get_header_key(&self) -> Option<HeaderKey> {
+        self.current.header_key.clone().or(self.current.sending_chain.as_ref().map(|d| d.header_key.clone()).flatten())
+    }
+
     pub fn get_sending_key(
         &mut self,
     ) -> Result<(MessageKey, SessionHeader, Option<HeaderKey>), DoubleRatchetError> {
@@ -488,17 +435,24 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
     }
 
     pub fn from_header(bytes: &[u8], keystore: K) -> Result<Self, DoubleRatchetError> {
-        let header = if (bytes[0] & 0x80) > 0 {
+        let mut hash_key = [0u8; 32];
+        hash_key.copy_from_slice(&bytes[..32]);
+
+        let header_key = keystore
+            .get_header_key(&hash_key)
+            .ok_or(DoubleRatchetError::SessionNotFound)?;
+
+        let header = if bytes.len() == 96 {
             let encrypted_bytes = bytes
-                .first_chunk()
-                .ok_or(DoubleRatchetError::InvalidHeader)?;
-            SessionHeader::decrypt(encrypted_bytes, &keystore)
+                .try_into()
+                .map_err(|_| DoubleRatchetError::InvalidHeader)?;
+            header_key.decrypt_header(encrypted_bytes)
                 .map_err(|_| DoubleRatchetError::InvalidHeader)?
-        } else if bytes.len() == 64 {
+        } else if bytes.len() == 36 {
             SessionHeader::from_bytes(
                 bytes
-                    .first_chunk()
-                    .ok_or(DoubleRatchetError::InvalidHeader)?,
+                    .try_into()
+                    .map_err(|_| DoubleRatchetError::InvalidHeader)?,
             )
         } else {
             return Err(DoubleRatchetError::InvalidHeader);
