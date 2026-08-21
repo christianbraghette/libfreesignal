@@ -517,7 +517,7 @@ impl Chain {
     }
 
     fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() == CHAIN_SIZE {
+        if bytes.len() != CHAIN_SIZE {
             None
         } else if bytes == [0u8; CHAIN_SIZE] {
             None
@@ -822,5 +822,170 @@ mod tests {
         assert_eq!(header.count, 1);
         assert_eq!(header_key, Some(initial_header_key));
         assert_ne!(msg_key.0, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_double_ratchet_errors_display() {
+        assert_eq!(
+            format!("{}", DoubleRatchetError::NoSendingChain),
+            "Uninitialized sending chain"
+        );
+        assert_eq!(
+            format!("{}", DoubleRatchetError::MaxSkipExceeded),
+            "Message count exceeds MAX_SKIP threshold"
+        );
+        assert_eq!(
+            format!("{}", DoubleRatchetError::InvalidHeader),
+            "Invalid header"
+        );
+    }
+
+    #[test]
+    fn test_session_header_serialization() {
+        let header = SessionHeader {
+            count: 42,
+            previous: 12,
+            remote_key: PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng)),
+        };
+
+        let bytes = header.to_bytes();
+        let decoded = SessionHeader::from_bytes(&bytes);
+
+        assert_eq!(header.count, decoded.count);
+        assert_eq!(header.previous, decoded.previous);
+        assert_eq!(header.remote_key.as_bytes(), decoded.remote_key.as_bytes());
+    }
+
+    #[test]
+    fn test_session_data_serialization_roundtrip() {
+        let bob_keystore = MemoryKeystore::new();
+        let bob_init = SessionInit {
+            user_id: UserId([1u8; 32]),
+            remote_key: None,
+            root_key: RootKey([2u8; 32]),
+            secret_key: None,
+            header_key: Some(HeaderKey([3u8; 32])),
+            next_header_key: None,
+        };
+        let mut session = Session::new(&bob_init, bob_keystore);
+
+        // Inizializziamo a forza una catena per massimizzare i byte testati
+        let fake_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
+        session.current.sending_chain =
+            Some(session.init_chain(&fake_remote, None, Some(5)).unwrap());
+
+        let bytes = session.current.to_bytes();
+        let decoded = SessionData::from_bytes(&bytes);
+
+        assert_eq!(session.current.session_tag.0, decoded.session_tag.0);
+        assert_eq!(session.current.user_id.0, decoded.user_id.0);
+        assert_eq!(session.current.root_key.0, decoded.root_key.0);
+
+        // Verifica che la chain decodificata abbia mantenuto i campi corretti
+        assert!(decoded.sending_chain.is_some());
+        assert_eq!(decoded.sending_chain.clone().unwrap().previous_count, 5);
+    }
+
+    #[test]
+    fn test_max_skip_exceeded_rejection() {
+        let shared_root_key = RootKey([7u8; 32]);
+        let bob_keystore = MemoryKeystore::default();
+        let bob_init = SessionInit {
+            user_id: UserId([1u8; 32]),
+            remote_key: None,
+            secret_key: None,
+            root_key: shared_root_key,
+            header_key: None,
+            next_header_key: None,
+        };
+        let mut bob_session = Session::new(&bob_init, bob_keystore);
+
+        // Header forgiato malevolmente o saltando troppi frame
+        let fake_header = SessionHeader {
+            count: super::MAX_SKIP + 1, // 2001
+            previous: 0,
+            remote_key: PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng)),
+        };
+
+        let result = bob_session.get_receiving_key(&fake_header);
+        assert_eq!(result.err(), Some(DoubleRatchetError::MaxSkipExceeded));
+    }
+
+    #[test]
+    fn test_invalid_header_past_previous_count() {
+        let shared_root_key = RootKey([8u8; 32]);
+        let bob_keystore = MemoryKeystore::default();
+        let bob_init = SessionInit {
+            user_id: UserId([2u8; 32]),
+            remote_key: None,
+            secret_key: None,
+            root_key: shared_root_key.clone(),
+            header_key: None,
+            next_header_key: None,
+        };
+        let mut bob_session = Session::new(&bob_init, bob_keystore.clone());
+
+        // Inizializza una chain locale manuale simulando vecchi messaggi
+        let old_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
+        let mut mock_rc = bob_session.init_chain(&old_remote, None, None).unwrap();
+        mock_rc.count = 50;
+        bob_session.current.receiving_chain = Some(mock_rc);
+
+        let new_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
+        let bad_header = SessionHeader {
+            count: 10,
+            previous: 10, // Più piccolo del count corrente nella receiving chain preesistente (50)
+            remote_key: new_remote,
+        };
+
+        // Bob riceve la nuova chiave asimmetrica, ma tenta un rollback indietro nel tempo (re-play attack asincrono)
+        let result = bob_session.get_receiving_key(&bad_header);
+        assert_eq!(result.err(), Some(DoubleRatchetError::InvalidHeader));
+    }
+
+    #[test]
+    fn test_session_rollback() {
+        let bob_keystore = MemoryKeystore::new();
+        let init = SessionInit {
+            user_id: UserId([1u8; 32]),
+            remote_key: None,
+            root_key: RootKey([2u8; 32]),
+            secret_key: None,
+            header_key: None,
+            next_header_key: None,
+        };
+        let mut session = Session::new(&init, bob_keystore);
+
+        // Commit dello stato iniziale (salva in self.previous)
+        session.commit();
+        let initial_root = session.current.root_key.clone();
+
+        // Mutiamo la sessione (simuliamo l'inizializzazione di una nuova catena,
+        // che fa espandere la root_key mutandola irreversibilmente)
+        let fake_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
+        let new_chain = session.init_chain(&fake_remote, None, None).unwrap();
+        session.current.receiving_chain = Some(new_chain);
+
+        // Assicuriamoci che lo stato crittografico sia cambiato
+        assert_ne!(session.current.root_key.0, initial_root.0);
+
+        // Eseguiamo il rollback
+        let rolled_back = session.rollback();
+        assert!(
+            rolled_back,
+            "Il rollback dovrebbe avere successo se esiste uno stato precedente"
+        );
+
+        // Verifichiamo che la chiave radice sia tornata quella originale
+        assert_eq!(
+            session.current.root_key.0, initial_root.0,
+            "La sessione deve tornare allo stato precedente"
+        );
+
+        // Un secondo rollback deve fallire (il backup viene rimosso dopo il primo uso)
+        assert!(
+            !session.rollback(),
+            "Non è possibile fare un doppio rollback consecutivo"
+        );
     }
 }

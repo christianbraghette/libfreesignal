@@ -221,7 +221,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
                 .keystore
                 .load_pre_key(&hash)
                 .ok_or(KeyExchangeError::PreKeyNotFound)?;
-            
+
             // Invece di eliminarla subito, salviamo l'hash
             opk_to_delete = Some(hash);
             Some(key)
@@ -341,7 +341,9 @@ mod tests {
 
     impl HeaderKeyStore for MemorySessionKeystore {
         fn set_header_key(&self, key: &HashKey, value: &HeaderKey) {
-            self.header_keys.borrow_mut().insert(key.clone(), value.clone());
+            self.header_keys
+                .borrow_mut()
+                .insert(key.clone(), value.clone());
         }
 
         fn get_header_key(&self, key: &HashKey) -> Option<HeaderKey> {
@@ -349,8 +351,7 @@ mod tests {
         }
     }
 
-    impl SessionKeyStore<{SESSION_DATA_SIZE}, SessionData> for MemorySessionKeystore {
-
+    impl SessionKeyStore<{ SESSION_DATA_SIZE }, SessionData> for MemorySessionKeystore {
         fn set_previous_keys(&self, key: &SessionTag, value: &crate::MessageKey) {
             self.previous_keys
                 .borrow_mut()
@@ -375,10 +376,17 @@ mod tests {
         }
 
         fn set_data(&self, session: &SessionData) {
-            self.session_data.borrow_mut().insert(session.get_session_tag(), session.clone());
+            self.session_data
+                .borrow_mut()
+                .insert(session.get_session_tag(), session.clone());
         }
 
-        fn set_hash_key(&self, hash_key: &HashKey, public_key: &PublicKey, session_tag: &SessionTag) {
+        fn set_hash_key(
+            &self,
+            hash_key: &HashKey,
+            public_key: &PublicKey,
+            session_tag: &SessionTag,
+        ) {
             self.pub_key_map
                 .borrow_mut()
                 .insert(hash_key.clone(), public_key.clone());
@@ -388,11 +396,7 @@ mod tests {
         }
 
         fn get_data_by_hash(&self, hash_key: &HashKey) -> Option<SessionData> {
-            let tag = self
-                .session_tag_map
-                .borrow()
-                .get(&hash_key)
-                .cloned()?;
+            let tag = self.session_tag_map.borrow().get(&hash_key).cloned()?;
             self.get_data_by_tag(&tag)
         }
 
@@ -509,5 +513,90 @@ mod tests {
             alice_init.root_key.0, bob_init.root_key.0,
             "Handshake senza OPK deve produrre la stessa RootKey"
         );
+    }
+
+    #[test]
+    fn test_x3dh_errors_display() {
+        assert_eq!(
+            format!("{}", KeyExchangeError::VerificationError),
+            "Error validating PreKey signature"
+        );
+        assert_eq!(
+            format!("{}", KeyExchangeError::PreKeyNotFound),
+            "The requested PreKey was not found in the keystore"
+        );
+    }
+
+    #[test]
+    fn test_process_pre_key_bundle_invalid_signature() {
+        let bob_keystore = MockKeyStore::new();
+        let bob_identity = create_test_identity(&bob_keystore);
+        let bob_kx = KeyExchange::new(bob_identity, bob_keystore);
+
+        let mut bundle = bob_kx.create_pre_key_bundle::<1>();
+
+        // Manomettiamo la signature o la prekey forzando una chiave diversa
+        bundle.signed_pre_key = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
+
+        let alice_keystore = MockKeyStore::new();
+        let alice_identity = create_test_identity(&alice_keystore);
+        let alice_kx = KeyExchange::new(alice_identity, alice_keystore);
+
+        let result = alice_kx.process_pre_key_bundle(&bundle);
+        assert_eq!(result.err(), Some(KeyExchangeError::VerificationError));
+    }
+
+    #[test]
+    fn test_process_pre_key_message_not_found() {
+        let bob_keystore = MockKeyStore::new();
+        let bob_identity = create_test_identity(&bob_keystore);
+        let bob_kx = KeyExchange::new(bob_identity, bob_keystore);
+
+        let dummy_message = PreKeyMessage {
+            identity_key: create_test_identity(&MockKeyStore::new()).get_key(),
+            ephemeral_key: PublicKey::from(&StaticSecret::random_from_rng(OsRng)),
+            signed_pre_key_hash: [0u8; 32], // Hash inesistente nel keystore di Bob
+            onetime_pre_key_hash: None,
+        };
+
+        let result = bob_kx.process_pre_key_message(dummy_message);
+        assert_eq!(result.err(), Some(KeyExchangeError::PreKeyNotFound));
+    }
+
+    #[test]
+    fn test_opk_deletion_after_processing() {
+        let bob_keystore = MockKeyStore::new();
+        let bob_identity = create_test_identity(&bob_keystore);
+        let bob_kx = KeyExchange::new(bob_identity, bob_keystore.clone());
+
+        // Bob crea un bundle con 1 OPK
+        let bundle: PreKeyBundle<1> = bob_kx.create_pre_key_bundle();
+
+        let alice_keystore = MockKeyStore::new();
+        let alice_kx = KeyExchange::new(create_test_identity(&alice_keystore), alice_keystore);
+
+        // Alice elabora il bundle e invia il messaggio
+        let (_, pre_key_msg) = alice_kx.process_pre_key_bundle(&bundle).unwrap();
+
+        assert!(pre_key_msg.onetime_pre_key_hash.is_some());
+
+        // Verifichiamo quante chiavi ha Bob PRIMA (1 SPK + 1 OPK = 2 chiavi)
+        {
+            let store_guard = bob_keystore.store.lock().unwrap();
+            assert_eq!(store_guard.len(), 2);
+        }
+
+        // Bob riceve il messaggio di Alice e consuma la OPK
+        bob_kx.process_pre_key_message(pre_key_msg).unwrap();
+
+        // Verifichiamo quante chiavi ha Bob DOPO (1 SPK, OPK cancellata = 1 chiave)
+        {
+            let store_guard = bob_keystore.store.lock().unwrap();
+            assert_eq!(
+                store_guard.len(),
+                1,
+                "La OPK deve essere eliminata dal keystore dopo l'handshake (Forward Secrecy fallita)"
+            );
+        }
     }
 }

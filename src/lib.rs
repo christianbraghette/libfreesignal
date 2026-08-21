@@ -117,16 +117,16 @@ impl MessageKey {
             return Err(MessageEncryptionError());
         }
 
-        let mut pad_len = 0;
+        let mut pad_len: usize = 0;
         let mut found = 0u8;
-        
+
         for (i, &b) in padded.iter().rev().enumerate() {
-            let is_delimiter = (b == 0x80) as u8;
-            let is_valid_so_far = (found == 0) as u8;
-            
+            let is_delimiter = (b == 0x80) as usize;
+            let is_valid_so_far = (found == 0) as usize;
+
             let update_mask = is_delimiter & is_valid_so_far;
-            pad_len = (pad_len * (1 - update_mask)) + ((i as u8 + 1) * update_mask);
-            
+            pad_len = (pad_len * (1 - update_mask)) + ((i + 1) * update_mask);
+
             let is_not_zero = (b != 0x00) as u8;
             found = found | is_not_zero;
         }
@@ -135,7 +135,7 @@ impl MessageKey {
             return Err(MessageEncryptionError());
         }
 
-        let original_len = padded.len() - (pad_len as usize);
+        let original_len = padded.len() - pad_len;
         Ok(padded[..original_len].to_vec())
     }
 
@@ -289,4 +289,138 @@ pub trait KeyExchangeStore {
     fn store_pre_key(&self, prekey_hash: &[u8], prekey: &StaticSecret);
     fn load_pre_key(&self, prekey_hash: &[u8]) -> Option<StaticSecret>;
     fn remove_pre_key(&self, prekey_hash: &[u8]) -> bool;
+}
+
+#[cfg(test)]
+mod crypto_tests {
+    use super::*;
+
+    #[test]
+    fn test_error_display_formatting() {
+        assert_eq!(
+            format!("{}", MessageEncryptionError()),
+            "Failed crypto operation"
+        );
+        assert_eq!(
+            format!("{}", HeaderEncryptionError()),
+            "Failed crypto operation"
+        );
+    }
+
+    #[test]
+    fn test_padding_and_unpadding_valid() {
+        let plaintext = b"Hello Signal Protocol";
+        let padded = MessageKey::pad_plaintext(plaintext);
+
+        // Verifica che il padding renda l'array multiplo di PAD_BLOCK_SIZE
+        assert_eq!(padded.len() % PAD_BLOCK_SIZE, 0);
+
+        let unpadded = MessageKey::unpad_plaintext(&padded).unwrap();
+        assert_eq!(unpadded, plaintext.as_slice());
+    }
+
+    #[test]
+    fn test_padding_exact_block_size() {
+        // Se il testo è esattamente grande quanto il blocco, deve aggiungere
+        // un intero nuovo blocco per il delimitatore
+        let plaintext = vec![0x42; PAD_BLOCK_SIZE];
+        let padded = MessageKey::pad_plaintext(&plaintext);
+
+        assert_eq!(padded.len(), PAD_BLOCK_SIZE * 2);
+        let unpadded = MessageKey::unpad_plaintext(&padded).unwrap();
+        assert_eq!(unpadded, plaintext);
+    }
+
+    #[test]
+    fn test_unpad_invalid_length_or_empty() {
+        let empty: &[u8] = &[];
+        assert!(MessageKey::unpad_plaintext(empty).is_err());
+
+        // Lunghezza non multipla del blocco
+        let invalid_len = vec![0x00; PAD_BLOCK_SIZE + 1];
+        assert!(MessageKey::unpad_plaintext(&invalid_len).is_err());
+    }
+
+    #[test]
+    fn test_unpad_missing_delimiter() {
+        // Un blocco completamente zero senza il delimitatore 0x80 deve fallire
+        let invalid_pad = vec![0x00; PAD_BLOCK_SIZE];
+        assert!(MessageKey::unpad_plaintext(&invalid_pad).is_err());
+    }
+
+    #[test]
+    fn test_payload_encryption_decryption() {
+        let key = MessageKey([0xAA; 32]);
+        let plaintext = b"Secret data";
+        let aad = b"Associated Data Context";
+
+        let ciphertext = key.encrypt_padded_payload(plaintext, aad).unwrap();
+
+        // Decrittografia corretta
+        let decrypted = key.decrypt_padded_payload(&ciphertext, aad).unwrap();
+        assert_eq!(plaintext.as_slice(), decrypted);
+
+        // Fallimento con AAD errato
+        assert!(
+            key.decrypt_padded_payload(&ciphertext, b"Wrong Context")
+                .is_err()
+        );
+
+        // Fallimento con payload manomesso
+        let mut corrupted = ciphertext.clone();
+        corrupted[0] ^= 0xFF;
+        assert!(key.decrypt_padded_payload(&corrupted, aad).is_err());
+    }
+
+    #[derive(Clone)]
+    struct DummyHeader([u8; 32]);
+    impl Header<32> for DummyHeader {
+        fn get_public_key(&self) -> PublicKey {
+            PublicKey::from([0; 32])
+        }
+        fn to_bytes(&self) -> [u8; 32] {
+            self.0
+        }
+        fn from_bytes(bytes: &[u8; 32]) -> Self {
+            Self(*bytes)
+        }
+    }
+
+    #[test]
+    fn test_header_encryption_decryption() {
+        let key = HeaderKey([0xBB; 32]);
+        let header = DummyHeader([0x42; 32]);
+
+        let encrypted = key.encrypt_header(&header).unwrap();
+        // Verifica la dimensione: Nonce (12) + Data (32) + Tag (16) = 60 bytes
+        assert_eq!(encrypted.len(), 60);
+
+        let decrypted: DummyHeader = key.decrypt_header(&encrypted).unwrap();
+        assert_eq!(decrypted.0, header.0);
+
+        // Test di manomissione (tamper)
+        let mut tampered = encrypted.clone();
+        tampered[15] ^= 0xFF; // Flip di un bit nel ciphertext
+        assert!(key.decrypt_header::<32, DummyHeader>(&tampered).is_err());
+    }
+
+    #[test]
+    fn test_public_identity_derivation() {
+        let secret = StaticSecret::random_from_rng(rand_core::OsRng);
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret.to_bytes());
+        let identity = PublicIdentity(signing_key.verifying_key());
+
+        let user_id = identity.get_user_id();
+        assert_ne!(
+            user_id.0, [0u8; 32],
+            "Lo user_id derivato non deve essere vuoto"
+        );
+
+        let pub_key = identity.to_public_key();
+        assert_ne!(
+            pub_key.as_bytes(),
+            &[0u8; 32],
+            "La conversione a PublicKey non deve essere nulla"
+        );
+    }
 }
