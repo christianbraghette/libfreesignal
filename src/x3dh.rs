@@ -183,7 +183,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 
         Ok((
             SessionInit {
-                user_id: remote_user_id, // Associa il UserId remoto a SessionInit
+                user_id: remote_user_id,
                 remote_key: Some(bundle.signed_pre_key),
                 secret_key: None,
                 root_key,
@@ -222,7 +222,6 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
                 .load_pre_key(&hash)
                 .ok_or(KeyExchangeError::PreKeyNotFound)?;
 
-            // Invece di eliminarla subito, salviamo l'hash
             opk_to_delete = Some(hash);
             Some(key)
         } else {
@@ -335,7 +334,7 @@ mod tests {
         header_keys: Rc<RefCell<HashMap<HashKey, HeaderKey>>>,
         previous_keys: Rc<RefCell<HashMap<SessionTag, MessageKey>>>,
         session_data: Rc<RefCell<HashMap<SessionTag, SessionData>>>,
-        pub_key_map: Rc<RefCell<HashMap<HashKey, PublicKey>>>, // Aggiunto per set_public_key
+        pub_key_map: Rc<RefCell<HashMap<HashKey, PublicKey>>>,
         session_tag_map: Rc<RefCell<HashMap<HashKey, SessionTag>>>,
     }
 
@@ -428,7 +427,7 @@ mod tests {
 
         assert!(
             verification.is_ok(),
-            "La firma crittografica della Signed Pre-Key deve essere valida"
+            "The cryptographic signature of the Signed Pre-Key must be valid"
         );
     }
 
@@ -462,23 +461,20 @@ mod tests {
 
         let (alice_init, pre_key_msg) = alice_kx
             .process_pre_key_bundle(&bob_bundle)
-            .expect("Alice deve elaborare il bundle con successo");
+            .expect("Alice must process the bundle successfully");
 
         let bob_init = bob_kx
             .process_pre_key_message(pre_key_msg)
-            .expect("Bob deve elaborare il messaggio con successo");
+            .expect("Bob must process the message successfully");
 
-        // 4. VERIFICA FONDAMENTALE: Le RootKey calcolate devono essere IDENTICHE
         assert_eq!(
             alice_init.root_key.0, bob_init.root_key.0,
-            "Handshake X3DH fallito: Alice e Bob hanno calcolato RootKey differenti!"
+            "X3DH Handshake failed: Alice and Bob computed different RootKeys!"
         );
 
-        // Le chiavi di header trasversali devono combaciare
         assert_eq!(alice_init.header_key, bob_init.next_header_key);
         assert_eq!(alice_init.next_header_key, bob_init.header_key);
 
-        // 5. Verifica che le sessioni derivate comunichino via Double Ratchet
         type DR = crate::double_ratchet::Session<MemorySessionKeystore>;
 
         let mut alice_dr = DR::new(&alice_init, MemorySessionKeystore::default());
@@ -489,7 +485,7 @@ mod tests {
 
         assert_eq!(
             alice_msg_key.0, bob_msg_key.0,
-            "La chiave derivata da Bob deve coincidere con quella di Alice"
+            "The key derived by Bob must match Alice's"
         );
     }
 
@@ -511,7 +507,7 @@ mod tests {
 
         assert_eq!(
             alice_init.root_key.0, bob_init.root_key.0,
-            "Handshake senza OPK deve produrre la stessa RootKey"
+            "Handshake without OPK must produce the same RootKey"
         );
     }
 
@@ -535,7 +531,6 @@ mod tests {
 
         let mut bundle = bob_kx.create_pre_key_bundle::<1>();
 
-        // Manomettiamo la signature o la prekey forzando una chiave diversa
         bundle.signed_pre_key = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
 
         let alice_keystore = MockKeyStore::new();
@@ -555,7 +550,7 @@ mod tests {
         let dummy_message = PreKeyMessage {
             identity_key: create_test_identity(&MockKeyStore::new()).get_key(),
             ephemeral_key: PublicKey::from(&StaticSecret::random_from_rng(OsRng)),
-            signed_pre_key_hash: [0u8; 32], // Hash inesistente nel keystore di Bob
+            signed_pre_key_hash: [0u8; 32],
             onetime_pre_key_hash: None,
         };
 
@@ -569,33 +564,28 @@ mod tests {
         let bob_identity = create_test_identity(&bob_keystore);
         let bob_kx = KeyExchange::new(bob_identity, bob_keystore.clone());
 
-        // Bob crea un bundle con 1 OPK
         let bundle: PreKeyBundle<1> = bob_kx.create_pre_key_bundle();
 
         let alice_keystore = MockKeyStore::new();
         let alice_kx = KeyExchange::new(create_test_identity(&alice_keystore), alice_keystore);
 
-        // Alice elabora il bundle e invia il messaggio
         let (_, pre_key_msg) = alice_kx.process_pre_key_bundle(&bundle).unwrap();
 
         assert!(pre_key_msg.onetime_pre_key_hash.is_some());
 
-        // Verifichiamo quante chiavi ha Bob PRIMA (1 SPK + 1 OPK = 2 chiavi)
         {
             let store_guard = bob_keystore.store.lock().unwrap();
             assert_eq!(store_guard.len(), 2);
         }
 
-        // Bob riceve il messaggio di Alice e consuma la OPK
         bob_kx.process_pre_key_message(pre_key_msg).unwrap();
 
-        // Verifichiamo quante chiavi ha Bob DOPO (1 SPK, OPK cancellata = 1 chiave)
         {
             let store_guard = bob_keystore.store.lock().unwrap();
             assert_eq!(
                 store_guard.len(),
                 1,
-                "La OPK deve essere eliminata dal keystore dopo l'handshake (Forward Secrecy fallita)"
+                "The OPK must be deleted from the keystore after the handshake (Forward Secrecy failed)"
             );
         }
     }

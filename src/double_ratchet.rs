@@ -567,7 +567,7 @@ mod tests {
         header_keys: Rc<RefCell<HashMap<HashKey, HeaderKey>>>,
         previous_keys: Rc<RefCell<HashMap<SessionTag, MessageKey>>>,
         session_data: Rc<RefCell<HashMap<SessionTag, SessionData>>>,
-        pub_key_map: Rc<RefCell<HashMap<HashKey, PublicKey>>>, // Aggiunto per set_public_key
+        pub_key_map: Rc<RefCell<HashMap<HashKey, PublicKey>>>,
         session_tag_map: Rc<RefCell<HashMap<HashKey, SessionTag>>>,
     }
 
@@ -655,21 +655,14 @@ mod tests {
         }
     }
 
-    // --- 2. UNIT TEST ---
-
     #[test]
     fn test_session_message_exchange() {
-        let shared_root_key = RootKey([42u8; 32]); // Chiave radice derivata da X3DH
+        let shared_root_key = RootKey([42u8; 32]);
 
-        // ====================================================================
-        // FASE 1: INIZIALIZZAZIONE
-        // ====================================================================
-
-        // Inizializziamo Bob (il ricevente originale)
         let bob_keystore = MemoryKeystore::new();
         let bob_init = SessionInit {
             user_id: UserId(Sha256::digest("bob").into()),
-            remote_key: None, // Bob aspetta che Alice inizi
+            remote_key: None,
             root_key: shared_root_key.clone(),
             secret_key: None,
             header_key: None,
@@ -678,11 +671,10 @@ mod tests {
         let mut bob_session = Session::new(&bob_init, bob_keystore);
         let bob_public_key = PublicKey::from(&bob_session.current.secret_key);
 
-        // Inizializziamo Alice (il mittente originale)
         let alice_keystore = MemoryKeystore::new();
         let alice_init = SessionInit {
             user_id: UserId(Sha256::digest("alice").into()),
-            remote_key: Some(bob_public_key), // Alice conosce la chiave di Bob
+            remote_key: Some(bob_public_key),
             secret_key: None,
             root_key: shared_root_key,
             header_key: None,
@@ -690,65 +682,36 @@ mod tests {
         };
         let mut alice_session = Session::new(&alice_init, alice_keystore);
 
-        // ====================================================================
-        // FASE 2: ALICE INVIA IL PRIMO MESSAGGIO A BOB
-        // ====================================================================
-
         let (alice_msg_key_1, header_1, _) = alice_session.get_sending_key().unwrap();
 
-        // Bob riceve e computa la chiave
         let bob_msg_key_1 = bob_session.get_receiving_key(&header_1).unwrap();
 
-        // Le chiavi del messaggio derivate indipendentemente devono coincidere!
         assert_eq!(
             alice_msg_key_1.0, bob_msg_key_1.0,
-            "Le chiavi del primo messaggio non corrispondono"
+            "The keys of the first message do not match"
         );
 
-        // Verifica del cricchetto simmetrico.
-        // get_key() incrementa il contatore PRIMA di restituire la chiave,
-        // quindi il primo messaggio mai inviato su una catena ha count == 1,
-        // non 0 (0 e' lo stato iniziale della catena, prima di ogni get_key()).
         assert_eq!(header_1.count, 1);
-
-        // ====================================================================
-        // FASE 3: ALICE INVIA UN SECONDO MESSAGGIO (Symmetric Ratchet)
-        // ====================================================================
 
         let (alice_msg_key_2, header_2, _) = alice_session.get_sending_key().unwrap();
         let bob_msg_key_2 = bob_session.get_receiving_key(&header_2).unwrap();
 
         assert_eq!(
             alice_msg_key_2.0, bob_msg_key_2.0,
-            "Le chiavi del secondo messaggio non corrispondono"
+            "The keys of the second message do not match"
         );
 
-        // Il counter della catena di invio di Alice deve essersi incrementato:
-        // dopo il secondo get_key() il conteggio passa da 1 a 2.
         assert_eq!(header_2.count, 2);
 
-        // ====================================================================
-        // FASE 4: BOB RISPONDE AD ALICE (DH Ratchet / Asymmetric Ratchet)
-        // ====================================================================
-
-        // Bob ora invia un messaggio ad Alice. Questo forzerà lo scatto
-        // del cricchetto asimmetrico e la creazione di nuove catene
         let (bob_reply_key_1, header_reply_1, _) = bob_session.get_sending_key().unwrap();
         let alice_reply_key_1 = alice_session.get_receiving_key(&header_reply_1).unwrap();
 
         assert_eq!(
             bob_reply_key_1.0, alice_reply_key_1.0,
-            "Le chiavi della risposta di Bob non corrispondono"
+            "The keys of Bob's response do not match"
         );
 
-        // Controlliamo l'integrità del counter:
-        // È una nuova catena di invio appena creata (Bob -> Alice); dopo il
-        // primo get_key() il count vale 1 (stesso discorso di header_1.count).
         assert_eq!(header_reply_1.count, 1);
-        // "previous" riporta quanti messaggi Bob aveva mandato nella SUA
-        // vecchia catena di invio (non quanti ne ha ricevuti da Alice: quello
-        // è tracciato dalla receiving chain, non dalla sending chain). Bob
-        // non aveva ancora mai inviato nulla, quindi vale 0.
         assert_eq!(header_reply_1.previous, 0);
     }
 
@@ -792,7 +755,7 @@ mod tests {
         let bob_key_1_second = bob_session.get_receiving_key(&header_1);
         assert!(
             bob_key_1_second.is_err(),
-            "La chiave del messaggio saltato deve essere usata una sola volta"
+            "The skipped message key must be used only once"
         );
         let _ = bob_key_1_first;
     }
@@ -869,7 +832,6 @@ mod tests {
         };
         let mut session = Session::new(&bob_init, bob_keystore);
 
-        // Inizializziamo a forza una catena per massimizzare i byte testati
         let fake_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
         session.current.sending_chain =
             Some(session.init_chain(&fake_remote, None, Some(5)).unwrap());
@@ -879,9 +841,10 @@ mod tests {
 
         assert_eq!(session.current.session_tag.0, decoded.session_tag.0);
         assert_eq!(session.current.user_id.0, decoded.user_id.0);
+        assert_eq!(session.current.secret_key.to_bytes(), decoded.secret_key.to_bytes());
         assert_eq!(session.current.root_key.0, decoded.root_key.0);
-
-        // Verifica che la chain decodificata abbia mantenuto i campi corretti
+        assert_eq!(session.current.header_key, decoded.header_key);
+        assert_eq!(session.current.next_header_key, decoded.next_header_key);
         assert!(decoded.sending_chain.is_some());
         assert_eq!(decoded.sending_chain.clone().unwrap().previous_count, 5);
     }
@@ -900,7 +863,6 @@ mod tests {
         };
         let mut bob_session = Session::new(&bob_init, bob_keystore);
 
-        // Header forgiato malevolmente o saltando troppi frame
         let fake_header = SessionHeader {
             count: super::MAX_SKIP + 1, // 2001
             previous: 0,
@@ -925,7 +887,6 @@ mod tests {
         };
         let mut bob_session = Session::new(&bob_init, bob_keystore.clone());
 
-        // Inizializza una chain locale manuale simulando vecchi messaggi
         let old_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
         let mut mock_rc = bob_session.init_chain(&old_remote, None, None).unwrap();
         mock_rc.count = 50;
@@ -938,7 +899,6 @@ mod tests {
             remote_key: new_remote,
         };
 
-        // Bob riceve la nuova chiave asimmetrica, ma tenta un rollback indietro nel tempo (re-play attack asincrono)
         let result = bob_session.get_receiving_key(&bad_header);
         assert_eq!(result.err(), Some(DoubleRatchetError::InvalidHeader));
     }
@@ -956,33 +916,26 @@ mod tests {
         };
         let mut session = Session::new(&init, bob_keystore);
 
-        // Commit dello stato iniziale (salva in self.previous)
         session.commit();
         let initial_root = session.current.root_key.clone();
 
-        // Mutiamo la sessione (simuliamo l'inizializzazione di una nuova catena,
-        // che fa espandere la root_key mutandola irreversibilmente)
         let fake_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
         let new_chain = session.init_chain(&fake_remote, None, None).unwrap();
         session.current.receiving_chain = Some(new_chain);
 
-        // Assicuriamoci che lo stato crittografico sia cambiato
         assert_ne!(session.current.root_key.0, initial_root.0);
 
-        // Eseguiamo il rollback
         let rolled_back = session.rollback();
         assert!(
             rolled_back,
             "Il rollback dovrebbe avere successo se esiste uno stato precedente"
         );
 
-        // Verifichiamo che la chiave radice sia tornata quella originale
         assert_eq!(
             session.current.root_key.0, initial_root.0,
             "La sessione deve tornare allo stato precedente"
         );
 
-        // Un secondo rollback deve fallire (il backup viene rimosso dopo il primo uso)
         assert!(
             !session.rollback(),
             "Non è possibile fare un doppio rollback consecutivo"

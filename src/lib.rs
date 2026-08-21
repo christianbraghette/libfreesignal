@@ -53,7 +53,6 @@ impl MessageKey {
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&derived[32..44]);
 
-        // Pulisci il materiale grezzo dalla memoria
         derived.zeroize();
 
         (key, nonce)
@@ -100,11 +99,8 @@ impl MessageKey {
     fn pad_plaintext(plaintext: &[u8]) -> Vec<u8> {
         let mut padded = Vec::with_capacity(plaintext.len() + PAD_BLOCK_SIZE);
         padded.extend_from_slice(plaintext);
-
-        // Aggiungiamo sempre il delimitatore 0x80
         padded.push(0x80);
 
-        // Riempiamo con 0x00 fino al prossimo multiplo di PAD_BLOCK_SIZE
         while padded.len() % PAD_BLOCK_SIZE != 0 {
             padded.push(0x00);
         }
@@ -179,15 +175,15 @@ impl HeaderKey {
     ) -> Result<Vec<u8>, HeaderEncryptionError> {
         let key = Key::<Aes256Gcm>::from_slice(&self.0);
         let cipher = Aes256Gcm::new(key);
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // Genera 12 byte
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
         let ciphertext = cipher
             .encrypt(&nonce, header.to_bytes().as_slice())
-            .map_err(|_| HeaderEncryptionError())?; // Risultato: 36 (dati) + 16 (tag) = 52 byte
+            .map_err(|_| HeaderEncryptionError())?;
 
         let mut output = Vec::new();
-        output.extend_from_slice(&nonce); // 12 byte
-        output.extend_from_slice(&ciphertext); // 52 byte
+        output.extend_from_slice(&nonce);
+        output.extend_from_slice(&ciphertext);
 
         Ok(output)
     }
@@ -312,7 +308,6 @@ mod crypto_tests {
         let plaintext = b"Hello Signal Protocol";
         let padded = MessageKey::pad_plaintext(plaintext);
 
-        // Verifica che il padding renda l'array multiplo di PAD_BLOCK_SIZE
         assert_eq!(padded.len() % PAD_BLOCK_SIZE, 0);
 
         let unpadded = MessageKey::unpad_plaintext(&padded).unwrap();
@@ -321,8 +316,6 @@ mod crypto_tests {
 
     #[test]
     fn test_padding_exact_block_size() {
-        // Se il testo è esattamente grande quanto il blocco, deve aggiungere
-        // un intero nuovo blocco per il delimitatore
         let plaintext = vec![0x42; PAD_BLOCK_SIZE];
         let padded = MessageKey::pad_plaintext(&plaintext);
 
@@ -336,14 +329,12 @@ mod crypto_tests {
         let empty: &[u8] = &[];
         assert!(MessageKey::unpad_plaintext(empty).is_err());
 
-        // Lunghezza non multipla del blocco
         let invalid_len = vec![0x00; PAD_BLOCK_SIZE + 1];
         assert!(MessageKey::unpad_plaintext(&invalid_len).is_err());
     }
 
     #[test]
     fn test_unpad_missing_delimiter() {
-        // Un blocco completamente zero senza il delimitatore 0x80 deve fallire
         let invalid_pad = vec![0x00; PAD_BLOCK_SIZE];
         assert!(MessageKey::unpad_plaintext(&invalid_pad).is_err());
     }
@@ -356,17 +347,14 @@ mod crypto_tests {
 
         let ciphertext = key.encrypt_padded_payload(plaintext, aad).unwrap();
 
-        // Decrittografia corretta
         let decrypted = key.decrypt_padded_payload(&ciphertext, aad).unwrap();
         assert_eq!(plaintext.as_slice(), decrypted);
 
-        // Fallimento con AAD errato
         assert!(
             key.decrypt_padded_payload(&ciphertext, b"Wrong Context")
                 .is_err()
         );
 
-        // Fallimento con payload manomesso
         let mut corrupted = ciphertext.clone();
         corrupted[0] ^= 0xFF;
         assert!(key.decrypt_padded_payload(&corrupted, aad).is_err());
@@ -392,15 +380,13 @@ mod crypto_tests {
         let header = DummyHeader([0x42; 32]);
 
         let encrypted = key.encrypt_header(&header).unwrap();
-        // Verifica la dimensione: Nonce (12) + Data (32) + Tag (16) = 60 bytes
         assert_eq!(encrypted.len(), 60);
 
         let decrypted: DummyHeader = key.decrypt_header(&encrypted).unwrap();
         assert_eq!(decrypted.0, header.0);
 
-        // Test di manomissione (tamper)
         let mut tampered = encrypted.clone();
-        tampered[15] ^= 0xFF; // Flip di un bit nel ciphertext
+        tampered[15] ^= 0xFF;
         assert!(key.decrypt_header::<32, DummyHeader>(&tampered).is_err());
     }
 
@@ -413,14 +399,14 @@ mod crypto_tests {
         let user_id = identity.get_user_id();
         assert_ne!(
             user_id.0, [0u8; 32],
-            "Lo user_id derivato non deve essere vuoto"
+            "The derived user_id must not be empty"
         );
 
         let pub_key = identity.to_public_key();
         assert_ne!(
             pub_key.as_bytes(),
             &[0u8; 32],
-            "La conversione a PublicKey non deve essere nulla"
+            "Conversion to PublicKey must not be empty"
         );
     }
 }
