@@ -30,7 +30,7 @@ impl std::fmt::Display for DoubleRatchetError {
 impl std::error::Error for DoubleRatchetError {}
 
 const KEY_LENGTH: usize = 32;
-const MAX_SKIP: i16 = 2000;
+const MAX_SKIP: u32 = 2000;
 const SESSION_INFO: &[u8] = b"/freesignal/double_ratchet/v0.1";
 const CHAIN_INFO: &[u8] = b"/freesignal/double_ratchet/keychain/v0.1";
 const SESSION_TAG_INFO: &[u8] = b"/freesignal/double_ratchet/tag/v0.1";
@@ -40,37 +40,37 @@ pub struct ChainKey(pub [u8; 32]);
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SessionHeader {
-    pub count: i16,
-    pub previous: i16,
+    pub count: u32,
+    pub previous: u32,
     pub remote_key: PublicKey,
 }
 
-impl Header<36> for SessionHeader {
+impl Header<40> for SessionHeader {
     fn get_public_key(&self) -> PublicKey {
         self.remote_key
     }
 
-    fn to_bytes(&self) -> [u8; 36] {
-        let mut raw = [0u8; 36];
-        raw[0..2].copy_from_slice(&self.count.to_be_bytes());
-        raw[2..4].copy_from_slice(&self.previous.to_be_bytes());
-        raw[4..36].copy_from_slice(self.remote_key.as_bytes());
+    fn to_bytes(&self) -> [u8; 40] {
+        let mut raw = [0u8; 40];
+        raw[0..4].copy_from_slice(&self.count.to_be_bytes());
+        raw[4..8].copy_from_slice(&self.previous.to_be_bytes());
+        raw[8..40].copy_from_slice(self.remote_key.as_bytes());
         raw
     }
 
-    fn from_bytes(bytes: &[u8; 36]) -> Self {
-        let mut count = [0u8; 2];
-        count.copy_from_slice(&bytes[0..2]);
+    fn from_bytes(bytes: &[u8; 40]) -> Self {
+        let mut count = [0u8; 4];
+        count.copy_from_slice(&bytes[0..4]);
 
-        let mut previous = [0u8; 2];
-        previous.copy_from_slice(&bytes[2..4]);
+        let mut previous = [0u8; 4];
+        previous.copy_from_slice(&bytes[4..8]);
 
         let mut remote_key = [0u8; 32];
-        remote_key.copy_from_slice(&bytes[4..36]);
+        remote_key.copy_from_slice(&bytes[8..40]);
 
         Self {
-            count: i16::from_be_bytes(count) & 0x7FFF,
-            previous: i16::from_be_bytes(previous),
+            count: u32::from_be_bytes(count),
+            previous: u32::from_be_bytes(previous),
             remote_key: PublicKey::from(remote_key),
         }
     }
@@ -144,7 +144,7 @@ impl Data<SESSION_DATA_SIZE> for SessionData {
         Self {
             session_tag: SessionTag(session_tag),
             user_id: UserId(user_id),
-            secret_key: StaticSecret::from(next_header_key),
+            secret_key: StaticSecret::from(secret_key),
             root_key: RootKey(root_key),
             header_key: if header_key == [0u8; 32] {
                 None
@@ -239,7 +239,7 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
         &mut self,
         remote_key: &PublicKey,
         header_key: Option<&HeaderKey>,
-        previous_count: Option<i16>,
+        previous_count: Option<u32>,
     ) -> Result<Chain, DoubleRatchetError> {
         let shared_key = self.current.secret_key.diffie_hellman(remote_key);
         let mut hash_key = [0u8; KEY_LENGTH * 3];
@@ -438,14 +438,14 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
             .get_header_key(&HashKey(hash_key))
             .ok_or(DoubleRatchetError::SessionNotFound)?;
 
-        let header = if bytes.len() == 96 {
+        let header = if bytes.len() == 100 {
             let encrypted_bytes = bytes[32..]
                 .try_into()
                 .map_err(|_| DoubleRatchetError::InvalidHeader)?;
             header_key
                 .decrypt_header(encrypted_bytes)
                 .map_err(|_| DoubleRatchetError::InvalidHeader)?
-        } else if bytes.len() == 68 {
+        } else if bytes.len() == 72 {
             SessionHeader::from_bytes(
                 bytes[32..]
                     .try_into()
@@ -467,12 +467,12 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
     }
 }
 
-const CHAIN_SIZE: usize = 164;
+const CHAIN_SIZE: usize = 168;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Chain {
-    count: i16,
-    previous_count: i16,
+    count: u32,
+    previous_count: u32,
     public_key: PublicKey,
     remote_key: PublicKey,
     header_key: Option<HeaderKey>,
@@ -506,13 +506,13 @@ impl Chain {
 
     fn to_bytes(&self) -> [u8; CHAIN_SIZE] {
         let mut raw = [0u8; CHAIN_SIZE];
-        raw[..2].copy_from_slice(&self.count.to_be_bytes());
-        raw[2..4].copy_from_slice(&self.previous_count.to_be_bytes());
-        raw[4..36].copy_from_slice(self.public_key.as_bytes());
-        raw[36..68].copy_from_slice(self.remote_key.as_bytes());
-        raw[68..100].copy_from_slice(self.header_key.as_ref().map(|d| &d.0).unwrap_or(&[0u8; 32]));
-        raw[100..132].copy_from_slice(&self.next_header_key.0);
-        raw[132..].copy_from_slice(&self.chain_key.0);
+        raw[..4].copy_from_slice(&self.count.to_be_bytes());
+        raw[4..8].copy_from_slice(&self.previous_count.to_be_bytes());
+        raw[8..40].copy_from_slice(self.public_key.as_bytes());
+        raw[40..72].copy_from_slice(self.remote_key.as_bytes());
+        raw[72..104].copy_from_slice(self.header_key.as_ref().map(|d| &d.0).unwrap_or(&[0u8; 32]));
+        raw[104..136].copy_from_slice(&self.next_header_key.0);
+        raw[136..].copy_from_slice(&self.chain_key.0);
         raw
     }
 
@@ -522,24 +522,24 @@ impl Chain {
         } else if bytes == [0u8; CHAIN_SIZE] {
             None
         } else {
-            let mut count = [0u8; 2];
-            count.copy_from_slice(&bytes[..2]);
-            let mut previous_count = [0u8; 2];
-            previous_count.copy_from_slice(&bytes[2..4]);
+            let mut count = [0u8; 4];
+            count.copy_from_slice(&bytes[..4]);
+            let mut previous_count = [0u8; 4];
+            previous_count.copy_from_slice(&bytes[4..8]);
             let mut public_key = [0u8; 32];
-            public_key.copy_from_slice(&bytes[4..36]);
+            public_key.copy_from_slice(&bytes[8..40]);
             let mut remote_key = [0u8; 32];
-            remote_key.copy_from_slice(&bytes[36..68]);
+            remote_key.copy_from_slice(&bytes[40..72]);
             let mut header_key = [0u8; 32];
-            header_key.copy_from_slice(&bytes[68..100]);
+            header_key.copy_from_slice(&bytes[72..104]);
             let mut next_header_key = [0u8; 32];
-            next_header_key.copy_from_slice(&bytes[100..132]);
+            next_header_key.copy_from_slice(&bytes[104..136]);
             let mut chain_key = [0u8; 32];
-            chain_key.copy_from_slice(&bytes[132..]);
+            chain_key.copy_from_slice(&bytes[136..]);
 
             Some(Self {
-                count: i16::from_be_bytes(count),
-                previous_count: i16::from_be_bytes(previous_count),
+                count: u32::from_be_bytes(count),
+                previous_count: u32::from_be_bytes(previous_count),
                 public_key: PublicKey::from(public_key),
                 remote_key: PublicKey::from(remote_key),
                 header_key: if header_key == [0u8; 32] {
