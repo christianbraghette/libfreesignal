@@ -8,8 +8,9 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-mod double_ratchet;
-mod x3dh;
+pub mod double_ratchet;
+pub mod x3dh;
+pub mod node;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq, Debug)]
 pub struct UserId(pub [u8; 32]);
