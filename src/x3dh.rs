@@ -276,8 +276,8 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::double_ratchet::SessionData;
-    use crate::{SessionKeyStore, SessionTag, HeaderHash};
+    use crate::double_ratchet::{SESSION_DATA_SIZE, SessionData};
+    use crate::{Data, HeaderKeyStore, SessionKeyStore, SessionTag};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use std::cell::RefCell;
@@ -325,12 +325,12 @@ mod tests {
     #[derive(Clone, Default)]
     struct MemorySessionKeystore {
         header_keys: Rc<RefCell<HashMap<[u8; 32], HeaderKey>>>,
-        previous_keys: Rc<RefCell<HashMap<[u8; 32], crate::MessageKey>>>,
-        session_data: Rc<RefCell<HashMap<[u8; 32], SessionData>>>,
+        previous_keys: Rc<RefCell<HashMap<SessionTag, crate::MessageKey>>>,
+        session_data: Rc<RefCell<HashMap<SessionTag, SessionData>>>,
         pub_key_map: Rc<RefCell<HashMap<[u8; 32], SessionTag>>>,
     }
 
-    impl SessionKeyStore<SessionData> for MemorySessionKeystore {
+    impl HeaderKeyStore for MemorySessionKeystore {
         fn set_header_key(&self, key: &[u8; 32], value: &HeaderKey) {
             self.header_keys.borrow_mut().insert(*key, value.clone());
         }
@@ -338,16 +338,21 @@ mod tests {
         fn get_header_key(&self, key: &[u8; 32]) -> Option<HeaderKey> {
             self.header_keys.borrow().get(key).cloned()
         }
+    }
 
-        fn set_previous_keys(&self, key: &[u8; 32], value: &crate::MessageKey) {
-            self.previous_keys.borrow_mut().insert(*key, value.clone());
+    impl SessionKeyStore<{SESSION_DATA_SIZE}, SessionData> for MemorySessionKeystore {
+
+        fn set_previous_keys(&self, key: &SessionTag, value: &crate::MessageKey) {
+            self.previous_keys
+                .borrow_mut()
+                .insert(key.clone(), value.clone());
         }
 
-        fn get_previous_keys(&self, key: &[u8; 32]) -> Option<crate::MessageKey> {
+        fn get_previous_keys(&self, key: &SessionTag) -> Option<crate::MessageKey> {
             self.previous_keys.borrow_mut().remove(key)
         }
 
-        fn del_previous_keys(&self, hash: Option<&HeaderHash>) -> bool {
+        fn del_previous_keys(&self, hash: Option<&SessionTag>) -> bool {
             if let Some(h) = hash {
                 self.previous_keys.borrow_mut().remove(h).is_some()
             } else {
@@ -360,8 +365,8 @@ mod tests {
             !self.previous_keys.borrow().is_empty()
         }
 
-        fn set_data(&self, public_key: &SessionTag, session: &SessionData) {
-            self.session_data.borrow_mut().insert(public_key.0, session.clone());
+        fn set_data(&self, session: &SessionData) {
+            self.session_data.borrow_mut().insert(session.get_session_tag(), session.clone());
         }
 
         fn set_public_key(&self, public_key: &PublicKey, session_tag: &SessionTag) {
@@ -374,7 +379,7 @@ mod tests {
         }
 
         fn get_data_by_tag(&self, session_tag: &SessionTag) -> Option<SessionData> {
-            self.session_data.borrow().get(&session_tag.0).cloned()
+            self.session_data.borrow().get(&session_tag).cloned()
         }
 
         fn commit(&self) {}

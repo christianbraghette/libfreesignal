@@ -13,14 +13,6 @@ pub struct UserId(pub [u8; 32]);
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct MessageKey(pub [u8; 32]);
 
-pub trait KeyExchangeStore {
-    fn get_signing_key(&self) -> SigningKey;
-    fn store_pre_key(&self, prekey_hash: &[u8], prekey: &StaticSecret);
-    fn load_pre_key(&self, prekey_hash: &[u8]) -> Option<StaticSecret>;
-    fn remove_pre_key(&self, prekey_hash: &[u8]) -> bool;
-}
-
-pub type HeaderHash = [u8; 32];
 pub type KeyHash = [u8; 32];
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
@@ -60,11 +52,35 @@ impl PublicIdentity {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderEncryptionError();
+
+impl std::fmt::Display for HeaderEncryptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Failed crypto operation")
+    }
+}
+
+impl std::error::Error for HeaderEncryptionError {}
+
 pub trait Header {
     fn get_public_key(&self) -> PublicKey;
-    fn hash(&self) -> HeaderHash;
-    fn to_bytes(&self) -> [u8; 36];
-    fn from_bytes(bytes: &[u8; 36]) -> Self;
+    fn encrypt(&self, header_key: &HeaderKey) -> Result<[u8; 96], HeaderEncryptionError>;
+    fn to_bytes(&self) -> [u8; 68];
+    fn from_bytes(bytes: &[u8; 68]) -> Self;
+
+    fn decrypt<K: HeaderKeyStore>(
+        encrypted_bytes: &[u8; 96],
+        keystore: &K,
+    ) -> Result<Self, HeaderEncryptionError>
+    where
+        Self: Sized;
+}
+
+pub trait Data<const N: usize> {
+    fn get_session_tag(&self) -> SessionTag;
+    fn to_bytes(&self) -> [u8; N];
+    fn from_bytes(bytes: &[u8; N]) -> Self;
 }
 
 #[derive(Zeroize, ZeroizeOnDrop, Clone)]
@@ -77,20 +93,31 @@ pub struct SessionInit {
     pub next_header_key: Option<HeaderKey>,
 }
 
-pub trait SessionKeyStore<Data> {
-    fn set_data(&self, public_key: &SessionTag, session: &Data);
+pub type HashKey = [u8; 32];
+
+pub trait HeaderKeyStore {
+    fn set_header_key(&self, hash_key: &HashKey, value: &HeaderKey);
+    fn get_header_key(&self, hash_key: &HashKey) -> Option<HeaderKey>;
+}
+
+pub trait SessionKeyStore<const N: usize, D: Data<N>> {
+    fn set_data(&self, session: &D);
     fn set_public_key(&self, public_key: &PublicKey, session_tag: &SessionTag);
-    fn get_data_by_key(&self, public_key: &PublicKey) -> Option<Data>;
-    fn get_data_by_tag(&self, session_tag: &SessionTag) -> Option<Data>;
+    fn get_data_by_key(&self, public_key: &PublicKey) -> Option<D>;
+    fn get_data_by_tag(&self, session_tag: &SessionTag) -> Option<D>;
 
-    fn set_header_key(&self, header_key: &KeyHash, value: &HeaderKey);
-    fn get_header_key(&self, header_key: &KeyHash) -> Option<HeaderKey>;
-
-    fn set_previous_keys(&self, hash: &HeaderHash, value: &MessageKey);
-    fn get_previous_keys(&self, hash: &HeaderHash) -> Option<MessageKey>;
-    fn del_previous_keys(&self, hash: Option<&HeaderHash>) -> bool;
+    fn set_previous_keys(&self, session_tag: &SessionTag, value: &MessageKey);
+    fn get_previous_keys(&self, session_tag: &SessionTag) -> Option<MessageKey>;
+    fn del_previous_keys(&self, session_tag: Option<&SessionTag>) -> bool;
     fn has_previous_keys(&self) -> bool;
 
     fn commit(&self);
     fn rollback(&self) -> bool;
+}
+
+pub trait KeyExchangeStore {
+    fn get_signing_key(&self) -> SigningKey;
+    fn store_pre_key(&self, prekey_hash: &[u8], prekey: &StaticSecret);
+    fn load_pre_key(&self, prekey_hash: &[u8]) -> Option<StaticSecret>;
+    fn remove_pre_key(&self, prekey_hash: &[u8]) -> bool;
 }
