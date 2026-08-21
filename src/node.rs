@@ -13,22 +13,6 @@
 //! [`NodeDirectory`] traits, mirroring the way [`crate::SessionKeyStore`] and
 //! [`crate::KeyExchangeStore`] decouple persistence in the rest of this crate.
 //!
-//! ## Cargo.toml additions
-//!
-//! ```toml
-//! axum = "0.7"
-//! tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
-//! serde = { version = "1", features = ["derive"] }
-//! serde_json = "1"
-//! async-trait = "0.1"
-//! reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-//! base64 = "0.22"
-//! rand_core = { version = "0.6", features = ["std"] } # already a dependency of x3dh.rs
-//! subtle = "2"                                        # already a dependency of double_ratchet.rs
-//! ```
-//!
-//! And add `pub mod node;` alongside the existing `mod double_ratchet;` /
-//! `mod x3dh;` declarations in `lib.rs`.
 
 use async_trait::async_trait;
 use axum::{
@@ -48,6 +32,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -125,6 +112,7 @@ pub struct EncryptedEnvelope {
     pub message_id: String,
     pub sender_id: String,
     pub recipient_id: String,
+    pub recipient_node_url: Option<String>,
     /// Base64-encoded output of `HeaderKey::encrypt_header`.
     pub header: String,
     /// Base64-encoded output of `MessageKey::encrypt_padded_payload`.
@@ -135,11 +123,12 @@ pub struct EncryptedEnvelope {
 #[derive(Debug, Deserialize)]
 pub struct DepositMessageRequest {
     pub recipient_id: String,
+    pub recipient_node_url: Option<String>,
     pub header: String,
     pub ciphertext: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DepositMessageResponse {
     pub message_id: String,
     /// True if the message had to be forwarded to a peer node rather than
@@ -178,8 +167,108 @@ pub trait MessageStore: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// Authentication traits
+// Authentication
 // ---------------------------------------------------------------------------
+
+/// Genera il Bearer token deterministico lato client a partire dalla chiave privata Ed25519 (IK).
+pub fn derive_client_auth_token(identity_key: &SigningKey, client_id: &str) -> String {
+    let domain_payload = format!("freesignal-auth-v1:{client_id}");
+    let signature = identity_key.sign(domain_payload.as_bytes());
+    // Il token è la firma Ed25519 formattata in base64
+    BASE64.encode(signature.to_bytes())
+}
+
+/// Helper per calcolare l'hash SHA-256 del token da salvare a riposo nel DB/Store
+fn hash_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    BASE64.encode(hasher.finalize())
+}
+
+/// Autenticatore persistent/registrabile basato su hash di token ed25519
+#[derive(Default)]
+pub struct Ed25519TokenAuthenticator {
+    /// Mappa: hash(token) -> client_id
+    pub token_hashes: RwLock<HashMap<String, String>>,
+    /// Mappa: client_id -> Public Key Ed25519 (per verificare future re-registrazioni o rotazioni)
+    pub registered_keys: RwLock<HashMap<String, [u8; 32]>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterClientResponse {
+    pub client_id: String,
+    pub timestamp: u64,
+    /// Hash del token registrato (per conferma matching)
+    pub token_hash: String,
+    /// Firma Ed25519 del server sul payload: "freesignal-ack-v1:<client_id>:<token_hash>:<timestamp>"
+    pub server_signature: String,
+}
+
+impl Ed25519TokenAuthenticator {
+    /// Registra un nuovo client verificando che il token sia stato effettivamente 
+    /// firmato dalla chiave pubblica Ed25519 fornita durante il setup X3DH.
+    pub async fn register_client(
+        &self,
+        server_signing_key: &SigningKey,
+        client_id: String,
+        public_key_bytes: [u8; 32],
+        token: &str,
+    ) -> Result<RegisterClientResponse, NodeError> {
+        let verifying_key = VerifyingKey::from_bytes(&public_key_bytes)
+            .map_err(|_| NodeError::InvalidRequest("Invalid Ed25519 public key".into()))?;
+
+        // 1. Decodifica la firma (il token)
+        let sig_bytes = BASE64
+            .decode(token)
+            .map_err(|_| NodeError::InvalidRequest("Token must be base64".into()))?;
+        
+        let signature_bytes: [u8; 64] = sig_bytes
+            .try_into()
+            .map_err(|_| NodeError::InvalidRequest("Invalid signature length".into()))?;
+        
+        let signature = Signature::from_bytes(&signature_bytes);
+
+        // 2. Verifica che il token sia stato generato dalla chiave privata corrispondente a public_key_bytes
+        let domain_payload = format!("freesignal-auth-v1:{client_id}");
+        verifying_key
+            .verify(domain_payload.as_bytes(), &signature)
+            .map_err(|_| NodeError::Unauthorized)?;
+
+        let token_hash = hash_token(token);
+        let timestamp = unix_timestamp();
+
+        let mut hashes = self.token_hashes.write().await;
+        let mut keys = self.registered_keys.write().await;
+
+        hashes.insert(token_hash.clone(), client_id.clone());
+        keys.insert(client_id.clone(), public_key_bytes);
+
+        // Genera la ricevuta firmata dal server
+        let ack_payload = format!("freesignal-ack-v1:{client_id}:{token_hash}:{timestamp}");
+        let signature = server_signing_key.sign(ack_payload.as_bytes());
+
+        Ok(RegisterClientResponse {
+            client_id,
+            timestamp,
+            token_hash,
+            server_signature: BASE64.encode(signature.to_bytes()),
+        })
+    }
+}
+
+#[async_trait]
+impl ClientAuthenticator for Ed25519TokenAuthenticator {
+    async fn authenticate(&self, credential: &str) -> Result<String, NodeError> {
+        let incoming_hash = hash_token(credential);
+        
+        self.token_hashes
+            .read()
+            .await
+            .get(&incoming_hash)
+            .cloned()
+            .ok_or(NodeError::Unauthorized)
+    }
+}
 
 /// Verifies a client-presented credential (bearer token / API key) and
 /// resolves it to the `client_id` it is authorized to act as. Kept
@@ -228,6 +317,7 @@ pub struct NodeConfig {
     /// Token this node presents to peers when relaying (must be accepted by
     /// the peer's [`NodeAuthenticator`]).
     pub outbound_node_token: String,
+    pub public_url: Option<String>,
 }
 
 /// Application state shared across all handlers. Every field is behind an
@@ -339,12 +429,31 @@ pub async fn deposit_message(
         message_id: generate_message_id(),
         sender_id,
         recipient_id: req.recipient_id.clone(),
+        recipient_node_url: req.recipient_node_url.clone(),
         header: req.header,
         ciphertext: req.ciphertext,
         timestamp: unix_timestamp(),
     };
 
-    match state.directory.locate(&req.recipient_id).await? {
+    // Routing: invio diretto all'URL specificato oppure discovery tramite directory
+    let location = match &req.recipient_node_url {
+        Some(target_url) => {
+            // Controlla se l'URL fornito coincide con l'URL di questo nodo
+            if state.config.public_url.as_deref() == Some(target_url.as_str()) {
+                NodeLocation::Local
+            } else {
+                NodeLocation::Remote {
+                    node_id: "direct-relay".into(),
+                    relay_url: target_url.clone(),
+                }
+            }
+        }
+        None => {
+            state.directory.locate(&req.recipient_id).await?
+        }
+    };
+
+    match location {
         NodeLocation::Local => {
             state.store.save_message(envelope.clone()).await?;
             Ok(Json(DepositMessageResponse {
@@ -507,7 +616,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// (database-backed, config-backed) implementations.
 pub mod mock {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use tokio::sync::RwLock;
 
     #[derive(Default)]
@@ -545,8 +654,6 @@ pub mod mock {
         }
     }
 
-    /// Static bearer-token → client_id map. Real deployments would replace
-    /// this with a JWT/OAuth check or a database lookup.
     #[derive(Default)]
     pub struct StaticTokenAuthenticator {
         pub tokens: HashMap<String, String>,
@@ -562,9 +669,6 @@ pub mod mock {
         }
     }
 
-    /// Constant-time, pre-shared-secret node authenticator. Swap for
-    /// signature verification (e.g. `ed25519_dalek::VerifyingKey::verify_strict`
-    /// over the request body) in production.
     #[derive(Default)]
     pub struct StaticNodeAuthenticator {
         pub secrets: HashMap<String, String>,
@@ -606,9 +710,6 @@ pub mod mock {
     }
 }
 
-/// Wires up the in-memory mocks and starts listening on `127.0.0.1:8080`.
-/// Not intended for production use — see [`mock`] for what each component
-/// would look like backed by real infrastructure.
 pub async fn example_main() -> std::io::Result<()> {
     use mock::*;
 
@@ -637,6 +738,7 @@ pub async fn example_main() -> std::io::Result<()> {
         config: Arc::new(NodeConfig {
             node_id: "node-a".to_string(),
             outbound_node_token: "shared-secret-with-b".to_string(),
+            public_url: Some("http://127.0.0.1:8080/api/node/relay".to_string()),
         }),
     };
 
@@ -653,7 +755,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use tower::ServiceExt; // for `oneshot`
+    use tower::ServiceExt;
 
     fn test_state() -> AppState {
         let mut tokens = HashMap::new();
@@ -681,6 +783,7 @@ mod tests {
             config: Arc::new(NodeConfig {
                 node_id: "node-a".to_string(),
                 outbound_node_token: "peer-secret".to_string(),
+                public_url: Some("http://node-a.internal/api/node/relay".to_string()),
             }),
         }
     }
@@ -736,6 +839,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deposit_with_explicit_local_url_stores_locally() {
+        let app = build_router(test_state());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/client/messages")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer alice-token")
+            .body(Body::from(
+                r#"{
+                    "recipient_id":"bob",
+                    "recipient_node_url":"http://node-a.internal/api/node/relay",
+                    "header":"aGVsbG8=",
+                    "ciphertext":"aGVsbG8="
+                }"#,
+            ))
+            .unwrap();
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: DepositMessageResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(!parsed.relayed);
+    }
+
+    #[tokio::test]
     async fn fetch_rejects_mismatched_client() {
         let app = build_router(test_state());
 
@@ -758,6 +890,7 @@ mod tests {
             message_id: "id-1".into(),
             sender_id: "carol".into(),
             recipient_id: "bob".into(),
+            recipient_node_url: None,
             header: "aGVsbG8=".into(),
             ciphertext: "aGVsbG8=".into(),
             timestamp: 0,
@@ -789,6 +922,7 @@ mod tests {
             message_id: "id-2".into(),
             sender_id: "carol".into(),
             recipient_id: "bob".into(),
+            recipient_node_url: None,
             header: "aGVsbG8=".into(),
             ciphertext: "aGVsbG8=".into(),
             timestamp: 0,
