@@ -1,9 +1,5 @@
-use crate::{Data, Header, HeaderEncryptionError, HeaderKeyStore};
+use crate::{Data, HashKey, Header, HeaderKeyStore};
 use crate::{HeaderKey, MessageKey, RootKey, SessionInit, SessionKeyStore, SessionTag, UserId};
-use aes_gcm::{
-    Aes256Gcm, Key, Nonce,
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -63,10 +59,6 @@ impl Header<36> for SessionHeader {
     }
 
     fn from_bytes(bytes: &[u8; 36]) -> Self {
-        if bytes.len() == 36 {
-
-        }
-
         let mut count = [0u8; 2];
         count.copy_from_slice(&bytes[0..2]);
 
@@ -203,10 +195,17 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
             previous: None,
         };
 
+        let public_key = session.get_public_key();
+        session.keystore.set_hash_key(
+            &HashKey(Sha256::digest(public_key.as_bytes()).into()),
+            &public_key,
+            &SessionTag(session_tag),
+        );
+
         session_tag.zeroize();
 
         if let Some(ref nhk) = init.next_header_key {
-            let hash: [u8; 32] = Sha256::digest(session.get_public_key().as_bytes()).into();
+            let hash = HashKey(Sha256::digest(session.get_public_key().as_bytes()).into());
             session.keystore.set_header_key(&hash, nhk);
         }
 
@@ -218,6 +217,8 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
             );
             session.current.header_key = None;
         }
+
+        session.commit();
 
         session
     }
@@ -272,19 +273,8 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
     }
 
     pub fn commit(&mut self) {
-        let session_tag = self.get_session_tag();
         self.previous = Some(self.current.clone());
         self.keystore.set_data(&self.current);
-
-        // Mappa la chiave pubblica remota al tag della sessione, se disponibile.
-        if let Some(chain) = &self.current.sending_chain {
-            self.keystore
-                .set_public_key(&chain.remote_key, &session_tag);
-        } else if let Some(chain) = &self.current.receiving_chain {
-            self.keystore
-                .set_public_key(&chain.remote_key, &session_tag);
-        }
-
         self.keystore.commit();
     }
 
@@ -302,7 +292,12 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
     }
 
     pub fn get_header_key(&self) -> Option<HeaderKey> {
-        self.current.header_key.clone().or(self.current.sending_chain.as_ref().map(|d| d.header_key.clone()).flatten())
+        self.current.header_key.clone().or(self
+            .current
+            .sending_chain
+            .as_ref()
+            .map(|d| d.header_key.clone())
+            .flatten())
     }
 
     pub fn get_sending_key(
@@ -387,7 +382,8 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
             self.current.receiving_chain = Some(new_rc.clone());
 
             let hash: [u8; 32] = Sha256::digest(self.get_public_key().as_bytes()).into();
-            self.keystore.set_header_key(&hash, &new_rc.next_header_key);
+            self.keystore
+                .set_header_key(&HashKey(hash), &new_rc.next_header_key);
 
             if self.current.next_header_key.is_some() {
                 self.current.next_header_key = None;
@@ -439,18 +435,19 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
         hash_key.copy_from_slice(&bytes[..32]);
 
         let header_key = keystore
-            .get_header_key(&hash_key)
+            .get_header_key(&HashKey(hash_key))
             .ok_or(DoubleRatchetError::SessionNotFound)?;
 
         let header = if bytes.len() == 96 {
-            let encrypted_bytes = bytes
+            let encrypted_bytes = bytes[32..]
                 .try_into()
                 .map_err(|_| DoubleRatchetError::InvalidHeader)?;
-            header_key.decrypt_header(encrypted_bytes)
+            header_key
+                .decrypt_header(encrypted_bytes)
                 .map_err(|_| DoubleRatchetError::InvalidHeader)?
-        } else if bytes.len() == 36 {
+        } else if bytes.len() == 68 {
             SessionHeader::from_bytes(
-                bytes
+                bytes[32..]
                     .try_into()
                     .map_err(|_| DoubleRatchetError::InvalidHeader)?,
             )
@@ -459,7 +456,7 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
         };
 
         let session_data = keystore
-            .get_data_by_key(&header.remote_key)
+            .get_data_by_hash(&HashKey(Sha256::digest(&header.remote_key).into()))
             .ok_or(DoubleRatchetError::SessionNotFound)?;
 
         Ok(Session::from(&session_data, keystore))
@@ -560,17 +557,18 @@ impl Chain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::KeyHash;
+    use crate::HashKey;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
 
     #[derive(Clone, Default)]
     struct MemoryKeystore {
-        header_keys: Rc<RefCell<HashMap<KeyHash, HeaderKey>>>,
+        header_keys: Rc<RefCell<HashMap<HashKey, HeaderKey>>>,
         previous_keys: Rc<RefCell<HashMap<SessionTag, MessageKey>>>,
         session_data: Rc<RefCell<HashMap<SessionTag, SessionData>>>,
-        pub_key_map: Rc<RefCell<HashMap<[u8; 32], SessionTag>>>, // Aggiunto per set_public_key
+        pub_key_map: Rc<RefCell<HashMap<HashKey, PublicKey>>>, // Aggiunto per set_public_key
+        session_tag_map: Rc<RefCell<HashMap<HashKey, SessionTag>>>,
     }
 
     impl MemoryKeystore {
@@ -586,11 +584,13 @@ mod tests {
     }
 
     impl HeaderKeyStore for MemoryKeystore {
-        fn set_header_key(&self, key: &KeyHash, value: &HeaderKey) {
-            self.header_keys.borrow_mut().insert(*key, value.clone());
+        fn set_header_key(&self, key: &HashKey, value: &HeaderKey) {
+            self.header_keys
+                .borrow_mut()
+                .insert(key.clone(), value.clone());
         }
 
-        fn get_header_key(&self, key: &KeyHash) -> Option<HeaderKey> {
+        fn get_header_key(&self, key: &HashKey) -> Option<HeaderKey> {
             self.header_keys.borrow().get(key).cloned()
         }
     }
@@ -625,18 +625,22 @@ mod tests {
                 .insert(session.get_session_tag(), session.clone());
         }
 
-        fn set_public_key(&self, public_key: &PublicKey, session_tag: &SessionTag) {
+        fn set_hash_key(
+            &self,
+            hash_key: &HashKey,
+            public_key: &PublicKey,
+            session_tag: &SessionTag,
+        ) {
             self.pub_key_map
                 .borrow_mut()
-                .insert(public_key.to_bytes(), session_tag.clone());
+                .insert(hash_key.clone(), public_key.clone());
+            self.session_tag_map
+                .borrow_mut()
+                .insert(hash_key.clone(), session_tag.clone());
         }
 
-        fn get_data_by_key(&self, public_key: &PublicKey) -> Option<SessionData> {
-            let tag = self
-                .pub_key_map
-                .borrow()
-                .get(&public_key.to_bytes())
-                .cloned()?;
+        fn get_data_by_hash(&self, hash_key: &HashKey) -> Option<SessionData> {
+            let tag = self.session_tag_map.borrow().get(&hash_key).cloned()?;
             self.get_data_by_tag(&tag)
         }
 

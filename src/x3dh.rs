@@ -277,7 +277,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 mod tests {
     use super::*;
     use crate::double_ratchet::{SESSION_DATA_SIZE, SessionData};
-    use crate::{Data, HeaderKeyStore, SessionKeyStore, SessionTag};
+    use crate::{Data, HashKey, HeaderKeyStore, MessageKey, SessionKeyStore, SessionTag};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use std::cell::RefCell;
@@ -324,18 +324,19 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct MemorySessionKeystore {
-        header_keys: Rc<RefCell<HashMap<[u8; 32], HeaderKey>>>,
-        previous_keys: Rc<RefCell<HashMap<SessionTag, crate::MessageKey>>>,
+        header_keys: Rc<RefCell<HashMap<HashKey, HeaderKey>>>,
+        previous_keys: Rc<RefCell<HashMap<SessionTag, MessageKey>>>,
         session_data: Rc<RefCell<HashMap<SessionTag, SessionData>>>,
-        pub_key_map: Rc<RefCell<HashMap<[u8; 32], SessionTag>>>,
+        pub_key_map: Rc<RefCell<HashMap<HashKey, PublicKey>>>, // Aggiunto per set_public_key
+        session_tag_map: Rc<RefCell<HashMap<HashKey, SessionTag>>>,
     }
 
     impl HeaderKeyStore for MemorySessionKeystore {
-        fn set_header_key(&self, key: &[u8; 32], value: &HeaderKey) {
-            self.header_keys.borrow_mut().insert(*key, value.clone());
+        fn set_header_key(&self, key: &HashKey, value: &HeaderKey) {
+            self.header_keys.borrow_mut().insert(key.clone(), value.clone());
         }
 
-        fn get_header_key(&self, key: &[u8; 32]) -> Option<HeaderKey> {
+        fn get_header_key(&self, key: &HashKey) -> Option<HeaderKey> {
             self.header_keys.borrow().get(key).cloned()
         }
     }
@@ -369,12 +370,21 @@ mod tests {
             self.session_data.borrow_mut().insert(session.get_session_tag(), session.clone());
         }
 
-        fn set_public_key(&self, public_key: &PublicKey, session_tag: &SessionTag) {
-            self.pub_key_map.borrow_mut().insert(public_key.to_bytes(), session_tag.clone());
+        fn set_hash_key(&self, hash_key: &HashKey, public_key: &PublicKey, session_tag: &SessionTag) {
+            self.pub_key_map
+                .borrow_mut()
+                .insert(hash_key.clone(), public_key.clone());
+            self.session_tag_map
+                .borrow_mut()
+                .insert(hash_key.clone(), session_tag.clone());
         }
 
-        fn get_data_by_key(&self, public_key: &PublicKey) -> Option<SessionData> {
-            let tag = self.pub_key_map.borrow().get(&public_key.to_bytes()).cloned()?;
+        fn get_data_by_hash(&self, hash_key: &HashKey) -> Option<SessionData> {
+            let tag = self
+                .session_tag_map
+                .borrow()
+                .get(&hash_key)
+                .cloned()?;
             self.get_data_by_tag(&tag)
         }
 

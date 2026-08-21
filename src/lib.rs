@@ -4,7 +4,7 @@ use aes_gcm::{
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -14,17 +14,18 @@ mod x3dh;
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq, Debug)]
 pub struct UserId(pub [u8; 32]);
 
-pub type KeyHash = [u8; 32];
+#[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
+pub struct HashKey(pub [u8; 32]);
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
 pub struct SessionTag(pub [u8; 32]);
 
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
 pub struct RootKey(pub [u8; 32]);
 
 const MESSAGE_KEY_INFO: &[u8] = b"/freesignal/payload/v0.1";
 
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
 pub struct MessageKey(pub [u8; 32]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,19 +39,22 @@ impl std::fmt::Display for MessageEncryptionError {
 
 impl std::error::Error for MessageEncryptionError {}
 
+const PAD_BLOCK_SIZE: usize = 128;
+
 impl MessageKey {
     fn derive_crypto_material(&self) -> ([u8; 32], [u8; 12]) {
         let hkdf = Hkdf::<Sha256>::new(None, &self.0);
-        let mut derived = [0u8; 44]; 
-        hkdf.expand(MESSAGE_KEY_INFO, &mut derived).expect("HKDF size is valid");
+        let mut derived = [0u8; 44];
+        hkdf.expand(MESSAGE_KEY_INFO, &mut derived)
+            .expect("HKDF size is valid");
 
         let mut key = [0u8; 32];
         key.copy_from_slice(&derived[..32]);
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&derived[32..44]);
-        
+
         // Pulisci il materiale grezzo dalla memoria
-        derived.zeroize(); 
+        derived.zeroize();
 
         (key, nonce)
     }
@@ -61,8 +65,7 @@ impl MessageKey {
         associated_data: &[u8],
     ) -> Result<Vec<u8>, MessageEncryptionError> {
         let (key, nonce) = self.derive_crypto_material();
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|_| MessageEncryptionError())?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| MessageEncryptionError())?;
         let nonce = Nonce::from_slice(&nonce);
 
         let payload = aes_gcm::aead::Payload {
@@ -81,8 +84,7 @@ impl MessageKey {
         associated_data: &[u8],
     ) -> Result<Vec<u8>, MessageEncryptionError> {
         let (key, nonce) = self.derive_crypto_material();
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|_| MessageEncryptionError())?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| MessageEncryptionError())?;
         let nonce = Nonce::from_slice(&nonce);
 
         let payload = aes_gcm::aead::Payload {
@@ -93,6 +95,54 @@ impl MessageKey {
         cipher
             .decrypt(&nonce, payload)
             .map_err(|_| MessageEncryptionError())
+    }
+
+    fn pad_plaintext(plaintext: &[u8]) -> Vec<u8> {
+        let mut padded = Vec::with_capacity(plaintext.len() + PAD_BLOCK_SIZE);
+        padded.extend_from_slice(plaintext);
+
+        // Aggiungiamo sempre il delimitatore 0x80
+        padded.push(0x80);
+
+        // Riempiamo con 0x00 fino al prossimo multiplo di PAD_BLOCK_SIZE
+        while padded.len() % PAD_BLOCK_SIZE != 0 {
+            padded.push(0x00);
+        }
+
+        padded
+    }
+
+    fn unpad_plaintext(padded: &[u8]) -> Result<Vec<u8>, MessageEncryptionError> {
+        if padded.is_empty() || padded.len() % PAD_BLOCK_SIZE != 0 {
+            return Err(MessageEncryptionError());
+        }
+
+        // Cerchiamo a ritroso il primo byte non zero (il delimitatore 0x80)
+        if let Some(pos) = padded.iter().rposition(|&b| b != 0x00) {
+            if padded[pos] == 0x80 {
+                return Ok(padded[..pos].to_vec());
+            }
+        }
+
+        Err(MessageEncryptionError())
+    }
+
+    pub fn encrypt_padded_payload(
+        &self,
+        plaintext: &[u8],
+        associated_data: &[u8],
+    ) -> Result<Vec<u8>, MessageEncryptionError> {
+        let padded_plaintext = Self::pad_plaintext(plaintext);
+        self.encrypt_payload(&padded_plaintext, associated_data)
+    }
+
+    pub fn decrypt_padded_payload(
+        &self,
+        ciphertext: &[u8],
+        associated_data: &[u8],
+    ) -> Result<Vec<u8>, MessageEncryptionError> {
+        let padded_plaintext = self.decrypt_payload(ciphertext, associated_data)?;
+        Self::unpad_plaintext(&padded_plaintext)
     }
 }
 
@@ -111,7 +161,7 @@ impl std::fmt::Display for HeaderEncryptionError {
 impl std::error::Error for HeaderEncryptionError {}
 
 impl HeaderKey {
-    pub fn encrypt_header<const N: usize,  H: Header<N>>(
+    pub fn encrypt_header<const N: usize, H: Header<N>>(
         &self,
         header: &H,
     ) -> Result<Vec<u8>, HeaderEncryptionError> {
@@ -183,13 +233,6 @@ pub trait Header<const N: usize> {
     fn get_public_key(&self) -> PublicKey;
     fn to_bytes(&self) -> [u8; N];
     fn from_bytes(bytes: &[u8; N]) -> Self;
-
-    /*fn decrypt<K: HeaderKeyStore>(
-        encrypted_bytes: &[u8; 96],
-        keystore: &K,
-    ) -> Result<Self, HeaderEncryptionError>
-    where
-        Self: Sized;*/
 }
 
 pub trait Data<const N: usize> {
@@ -208,17 +251,16 @@ pub struct SessionInit {
     pub next_header_key: Option<HeaderKey>,
 }
 
-pub type HashKey = [u8; 32];
-
 pub trait HeaderKeyStore {
     fn set_header_key(&self, hash_key: &HashKey, value: &HeaderKey);
     fn get_header_key(&self, hash_key: &HashKey) -> Option<HeaderKey>;
 }
 
 pub trait SessionKeyStore<const N: usize, D: Data<N>> {
+    fn set_hash_key(&self, hash_key: &HashKey, public_key: &PublicKey, session_tag: &SessionTag);
+
     fn set_data(&self, session: &D);
-    fn set_public_key(&self, public_key: &PublicKey, session_tag: &SessionTag);
-    fn get_data_by_key(&self, public_key: &PublicKey) -> Option<D>;
+    fn get_data_by_hash(&self, hash_key: &HashKey) -> Option<D>;
     fn get_data_by_tag(&self, session_tag: &SessionTag) -> Option<D>;
 
     fn set_previous_keys(&self, session_tag: &SessionTag, value: &MessageKey);
