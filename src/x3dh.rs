@@ -1,4 +1,4 @@
-use crate::{xed25519, HeaderKey, KeyExchangeStore, RootKey, SessionInit};
+use crate::{xed25519, KeyExchangeStore, SessionInit};
 use ed25519_dalek::{Signature, Signer, VerifyingKey};
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
@@ -53,7 +53,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         KeyExchange { keystore, identity }
     }
 
-    fn derive_session_keys(raw_material: &[u8]) -> (RootKey, HeaderKey, HeaderKey) {
+    fn derive_session_keys(raw_material: &[u8]) -> ([u8;32], [u8;32], [u8;32]) {
         let mut derived = [0u8; KEY_LENGTH * 3];
         let hkdf = Hkdf::<Sha256>::new(Some(&[0u8; KEY_LENGTH]), raw_material);
         hkdf.expand(X3DH_INFO, &mut derived)
@@ -71,9 +71,9 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         derived.zeroize();
 
         (
-            RootKey(root_key),
-            HeaderKey(header_key1),
-            HeaderKey(header_key2),
+            root_key,
+            header_key1,
+            header_key2,
         )
     }
 
@@ -273,7 +273,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 mod tests {
     use super::*;
     use crate::double_ratchet::{SessionData};
-    use crate::{Data, HashKey, MessageKey, SessionKeyStore, SessionTag};
+    use crate::{Data, HashKey, HeaderKey, MessageKey, SessionKeyStore, SessionTag};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use std::cell::RefCell;
@@ -463,7 +463,7 @@ mod tests {
             .expect("Bob must process the message successfully");
 
         assert_eq!(
-            alice_init.root_key.0, bob_init.root_key.0,
+            alice_init.root_key, bob_init.root_key,
             "X3DH Handshake failed: Alice and Bob computed different RootKeys!"
         );
 
@@ -501,7 +501,7 @@ mod tests {
         let bob_init = bob_kx.process_pre_key_message(pre_key_msg).unwrap();
 
         assert_eq!(
-            alice_init.root_key.0, bob_init.root_key.0,
+            alice_init.root_key, bob_init.root_key,
             "Handshake without OPK must produce the same RootKey"
         );
     }

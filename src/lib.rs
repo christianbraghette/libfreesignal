@@ -22,9 +22,6 @@ pub struct HashKey(pub [u8; 32]);
 pub struct SessionTag(pub [u8; 32]);
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
-pub struct RootKey(pub [u8; 32]);
-
-#[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
 pub struct MessageKey(pub [u8; 32]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,7 +152,7 @@ impl MessageKey {
 }
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq, Debug)]
-pub struct HeaderKey(pub [u8; 32]);
+pub struct HeaderKey([u8; 32]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeaderEncryptionError();
@@ -275,9 +272,9 @@ pub struct SessionInit {
     pub remote_identity: VerifyingKey,
     pub remote_key: Option<PublicKey>,
     pub secret_key: Option<StaticSecret>,
-    pub root_key: RootKey,
-    pub header_key: Option<HeaderKey>,
-    pub next_header_key: Option<HeaderKey>,
+    pub root_key: [u8; 32],
+    pub header_key: Option<[u8; 32]>,
+    pub next_header_key: Option<[u8; 32]>,
 }
 
 pub trait SessionKeyStore<D: Data> {

@@ -1,5 +1,5 @@
 use crate::{Data, HashKey, Header, HeaderError};
-use crate::{HeaderKey, MessageKey, RootKey, SessionInit, SessionKeyStore, SessionTag};
+use crate::{HeaderKey, MessageKey, SessionInit, SessionKeyStore, SessionTag};
 use ed25519_dalek::VerifyingKey;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -84,6 +84,9 @@ impl Header for SessionHeader {
     }
 }
 
+#[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
+pub struct RootKey([u8; 32]);
+
 #[derive(Zeroize, ZeroizeOnDrop, Clone)]
 pub struct SessionData {
     session_tag: SessionTag,
@@ -97,33 +100,35 @@ pub struct SessionData {
     receiving_chain: Option<Chain>,
 }
 
+const SESSION_DATA_SIZE: usize = 192 + CHAIN_SIZE * 2;
+
 impl Data for SessionData {
     fn get_session_tag(&self) -> SessionTag {
         self.session_tag.clone()
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        let mut raw = Vec::new();
+        let mut raw = Vec::with_capacity(SESSION_DATA_SIZE);
 
-        raw[..32].copy_from_slice(&self.session_tag.0);
-        raw[32..64].copy_from_slice(self.remote_identity.as_bytes());
-        raw[64..96].copy_from_slice(self.secret_key.as_bytes());
-        raw[96..128].copy_from_slice(&self.root_key.0);
-        raw[128..160].copy_from_slice(self.header_key.as_ref().map(|d| &d.0).unwrap_or(&[0u8; 32]));
-        raw[160..192].copy_from_slice(
+        raw.extend_from_slice(&self.session_tag.0);
+        raw.extend_from_slice(self.remote_identity.as_bytes());
+        raw.extend_from_slice(self.secret_key.as_bytes());
+        raw.extend_from_slice(&self.root_key.0);
+        raw.extend_from_slice(self.header_key.as_ref().map(|d| &d.0).unwrap_or(&[0u8; 32]));
+        raw.extend_from_slice(
             self.next_header_key
                 .as_ref()
                 .map(|d| &d.0)
                 .unwrap_or(&[0u8; 32]),
         );
-        raw[192..192 + CHAIN_SIZE].copy_from_slice(
+        raw.extend_from_slice(
             &self
                 .sending_chain
                 .as_ref()
                 .map(|d| d.to_bytes())
                 .unwrap_or([0u8; CHAIN_SIZE]),
         );
-        raw[192 + CHAIN_SIZE..].copy_from_slice(
+        raw.extend_from_slice(
             &self
                 .receiving_chain
                 .as_ref()
@@ -181,7 +186,7 @@ pub struct Session<K: SessionKeyStore<SessionData>> {
 impl<K: SessionKeyStore<SessionData>> Session<K> {
     pub fn new(init: &SessionInit, keystore: K) -> Session<K> {
         let mut session_tag = [0u8; KEY_LENGTH];
-        let hkdf = HkdfSha256::new(Some(&[0u8; KEY_LENGTH]), init.root_key.0.as_ref());
+        let hkdf = HkdfSha256::new(Some(&[0u8; KEY_LENGTH]), &init.root_key);
         hkdf.expand(SESSION_TAG_INFO, &mut session_tag)
             .expect("HKDF failed");
 
@@ -190,9 +195,9 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
             current: SessionData {
                 session_tag: SessionTag(session_tag),
                 remote_identity: init.remote_identity.clone(),
-                root_key: init.root_key.clone(),
-                header_key: init.header_key.clone(),
-                next_header_key: init.next_header_key.clone(),
+                root_key: RootKey(init.root_key),
+                header_key: init.header_key.map(|hk| HeaderKey(hk)),
+                next_header_key: init.next_header_key.map(|hk| HeaderKey(hk)),
                 secret_key: init
                     .secret_key
                     .clone()
@@ -214,7 +219,11 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
         if let Some(remote_key) = init.remote_key {
             session.current.sending_chain = Some(
                 session
-                    .init_chain(&remote_key, init.header_key.as_ref(), None)
+                    .init_chain(
+                        &remote_key,
+                        init.header_key.map(|hk| HeaderKey(hk)).as_ref(),
+                        None,
+                    )
                     .unwrap(),
             );
             session.current.header_key = None;
@@ -696,7 +705,7 @@ mod tests {
 
     #[test]
     fn test_session_message_exchange() {
-        let shared_root_key = RootKey([42u8; 32]);
+        let shared_root_key = [42u8; 32];
         let bob_identity = gen_identity();
         let alice_identity = gen_identity();
 
@@ -758,7 +767,7 @@ mod tests {
 
     #[test]
     fn test_skipped_key_is_single_use() {
-        let shared_root_key = RootKey([7u8; 32]);
+        let shared_root_key = [7u8; 32];
         let bob_identity = gen_identity();
         let alice_identity = gen_identity();
 
@@ -805,14 +814,14 @@ mod tests {
 
     #[test]
     fn test_session_get_sending_key_header_key_retrieval() {
-        let shared_root_key = RootKey([88u8; 32]);
+        let shared_root_key = [88u8; 32];
         let alice_identity = gen_identity();
         let bob_identity = gen_identity();
         let keystore = MemoryKeystore::new(alice_identity);
 
         let bob_secret = StaticSecret::random_from_rng(rand_core::OsRng);
         let bob_pubkey = PublicKey::from(&bob_secret);
-        let initial_header_key = HeaderKey([0x11; 32]);
+        let initial_header_key = [0x11; 32];
 
         let init = SessionInit {
             remote_identity: bob_identity,
@@ -827,7 +836,7 @@ mod tests {
         let (msg_key, header, header_key) = session.get_sending_key().unwrap();
 
         assert_eq!(header.count, 1);
-        assert_eq!(header_key, Some(initial_header_key));
+        assert_eq!(header_key.map(|d| d.0), Some(initial_header_key));
         assert_ne!(msg_key.0, [0u8; 32]);
     }
 
@@ -871,9 +880,9 @@ mod tests {
         let bob_init = SessionInit {
             remote_identity: alice_identity,
             remote_key: None,
-            root_key: RootKey([2u8; 32]),
+            root_key: [2u8; 32],
             secret_key: None,
-            header_key: Some(HeaderKey([3u8; 32])),
+            header_key: Some([3u8; 32]),
             next_header_key: None,
         };
         let mut session = Session::new(&bob_init, bob_keystore);
@@ -903,7 +912,7 @@ mod tests {
 
     #[test]
     fn test_max_skip_exceeded_rejection() {
-        let shared_root_key = RootKey([7u8; 32]);
+        let shared_root_key = [7u8; 32];
         let bob_identity = gen_identity();
         let alice_identity = gen_identity();
         let bob_keystore = MemoryKeystore::new(bob_identity);
@@ -929,7 +938,7 @@ mod tests {
 
     #[test]
     fn test_invalid_header_past_previous_count() {
-        let shared_root_key = RootKey([8u8; 32]);
+        let shared_root_key = [8u8; 32];
         let bob_identity = gen_identity();
         let alice_identity = gen_identity();
         let bob_keystore = MemoryKeystore::new(bob_identity);
@@ -967,7 +976,7 @@ mod tests {
         let init = SessionInit {
             remote_identity: alice_identity,
             remote_key: None,
-            root_key: RootKey([2u8; 32]),
+            root_key: [2u8; 32],
             secret_key: None,
             header_key: None,
             next_header_key: None,
