@@ -52,11 +52,11 @@ pub struct PreKeyMessage {
 
 pub struct KeyExchange<K: KeyExchangeStore> {
     pub keystore: K,
-    pub identity: PublicIdentity,
+    pub identity: VerifyingKey,
 }
 
 impl<K: KeyExchangeStore> KeyExchange<K> {
-    pub fn new(identity: PublicIdentity, keystore: K) -> KeyExchange<K> {
+    pub fn new(identity: VerifyingKey, keystore: K) -> KeyExchange<K> {
         KeyExchange { keystore, identity }
     }
 
@@ -112,7 +112,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         }));
         let public_key = PublicKey::from(&signed_pre_key_secret);
         PreKeyBundle {
-            identity_key: self.identity.get_key(),
+            identity_key: self.identity,
             signed_pre_key: public_key,
             signature: self.keystore.get_signing_key().sign(public_key.as_bytes()),
             onetime_pre_keys,
@@ -183,7 +183,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 
         Ok((
             SessionInit {
-                user_id: remote_user_id,
+                remote_identity: bundle.identity_key,
                 remote_key: Some(bundle.signed_pre_key),
                 secret_key: None,
                 root_key,
@@ -191,7 +191,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
                 next_header_key: Some(next_header_key),
             },
             PreKeyMessage {
-                identity_key: self.identity.get_key(),
+                identity_key: self.identity,
                 ephemeral_key: PublicKey::from(&ephemeral_key),
                 signed_pre_key_hash,
                 onetime_pre_key_hash,
@@ -270,7 +270,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         }
 
         Ok(SessionInit {
-            user_id: remote_user_id,
+            remote_identity: message.identity_key,
             remote_key: None,
             secret_key: Some(signed_pre_key),
             root_key,
@@ -284,7 +284,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 mod tests {
     use super::*;
     use crate::double_ratchet::{SESSION_DATA_SIZE, SessionData};
-    use crate::{Data, HashKey, HeaderKeyStore, MessageKey, SessionKeyStore, SessionTag};
+    use crate::{Data, HashKey, MessageKey, SessionKeyStore, SessionTag};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
     use std::cell::RefCell;
@@ -329,16 +329,32 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)] // Rimosso Default
     struct MemorySessionKeystore {
+        local_identity: VerifyingKey, // Aggiunto per soddisfare il trait
         header_keys: Rc<RefCell<HashMap<HashKey, HeaderKey>>>,
         previous_keys: Rc<RefCell<HashMap<SessionTag, MessageKey>>>,
         session_data: Rc<RefCell<HashMap<SessionTag, SessionData>>>,
-        pub_key_map: Rc<RefCell<HashMap<HashKey, PublicKey>>>,
         session_tag_map: Rc<RefCell<HashMap<HashKey, SessionTag>>>,
     }
 
-    impl HeaderKeyStore for MemorySessionKeystore {
+    impl MemorySessionKeystore {
+        fn new(local_identity: VerifyingKey) -> Self {
+            Self {
+                local_identity,
+                header_keys: Rc::new(RefCell::new(HashMap::new())),
+                previous_keys: Rc::new(RefCell::new(HashMap::new())),
+                session_data: Rc::new(RefCell::new(HashMap::new())),
+                session_tag_map: Rc::new(RefCell::new(HashMap::new())),
+            }
+        }
+    }
+
+    impl SessionKeyStore<{ SESSION_DATA_SIZE }, SessionData> for MemorySessionKeystore {
+        fn get_verifying_key(&self) -> VerifyingKey {
+            self.local_identity
+        }
+
         fn set_header_key(&self, key: &HashKey, value: &HeaderKey) {
             self.header_keys
                 .borrow_mut()
@@ -348,9 +364,7 @@ mod tests {
         fn get_header_key(&self, key: &HashKey) -> Option<HeaderKey> {
             self.header_keys.borrow().get(key).cloned()
         }
-    }
 
-    impl SessionKeyStore<{ SESSION_DATA_SIZE }, SessionData> for MemorySessionKeystore {
         fn set_previous_keys(&self, key: &SessionTag, value: &crate::MessageKey) {
             self.previous_keys
                 .borrow_mut()
@@ -383,12 +397,8 @@ mod tests {
         fn set_hash_key(
             &self,
             hash_key: &HashKey,
-            public_key: &PublicKey,
             session_tag: &SessionTag,
         ) {
-            self.pub_key_map
-                .borrow_mut()
-                .insert(hash_key.clone(), public_key.clone());
             self.session_tag_map
                 .borrow_mut()
                 .insert(hash_key.clone(), session_tag.clone());
@@ -409,8 +419,8 @@ mod tests {
         }
     }
 
-    fn create_test_identity(keystore: &MockKeyStore) -> PublicIdentity {
-        PublicIdentity(keystore.get_signing_key().verifying_key())
+    fn create_test_identity(keystore: &MockKeyStore) -> VerifyingKey {
+        keystore.get_signing_key().verifying_key()
     }
 
     #[test]
@@ -477,8 +487,8 @@ mod tests {
 
         type DR = crate::double_ratchet::Session<MemorySessionKeystore>;
 
-        let mut alice_dr = DR::new(&alice_init, MemorySessionKeystore::default());
-        let mut bob_dr = DR::new(&bob_init, MemorySessionKeystore::default());
+        let mut alice_dr = DR::new(&alice_init, MemorySessionKeystore::new(alice_identity));
+        let mut bob_dr = DR::new(&bob_init, MemorySessionKeystore::new(bob_identity));
 
         let (alice_msg_key, header, _) = alice_dr.get_sending_key().unwrap();
         let bob_msg_key = bob_dr.get_receiving_key(&header).unwrap();
@@ -548,7 +558,7 @@ mod tests {
         let bob_kx = KeyExchange::new(bob_identity, bob_keystore);
 
         let dummy_message = PreKeyMessage {
-            identity_key: create_test_identity(&MockKeyStore::new()).get_key(),
+            identity_key: create_test_identity(&MockKeyStore::new()),
             ephemeral_key: PublicKey::from(&StaticSecret::random_from_rng(OsRng)),
             signed_pre_key_hash: [0u8; 32],
             onetime_pre_key_hash: None,

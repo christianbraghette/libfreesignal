@@ -24,8 +24,6 @@ pub struct SessionTag(pub [u8; 32]);
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
 pub struct RootKey(pub [u8; 32]);
 
-const MESSAGE_KEY_INFO: &[u8] = b"/freesignal/payload/v0.1";
-
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
 pub struct MessageKey(pub [u8; 32]);
 
@@ -41,6 +39,7 @@ impl std::fmt::Display for MessageEncryptionError {
 impl std::error::Error for MessageEncryptionError {}
 
 const PAD_BLOCK_SIZE: usize = 128;
+const MESSAGE_KEY_INFO: &[u8] = b"/freesignal/encryption/v0.1/message";
 
 impl MessageKey {
     fn derive_crypto_material(&self) -> ([u8; 32], [u8; 12]) {
@@ -169,9 +168,16 @@ impl std::fmt::Display for HeaderEncryptionError {
 
 impl std::error::Error for HeaderEncryptionError {}
 
+const HEADER_KEY_INFO: &[u8] = b"/freesignal/encryption/v0.1/header";
+
 impl HeaderKey {
     pub fn encrypt_header<H: Header>(&self, header: &H) -> Result<Vec<u8>, HeaderEncryptionError> {
-        let key = Key::<Aes256Gcm>::from_slice(&self.0);
+        let hkdf = Hkdf::<Sha256>::new(None, &self.0);
+        let mut derived = [0u8; 32];
+        hkdf.expand(HEADER_KEY_INFO, &mut derived)
+            .expect("HKDF size is valid");
+
+        let key = Key::<Aes256Gcm>::from_slice(&derived);
         let cipher = Aes256Gcm::new(key);
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
@@ -256,7 +262,8 @@ pub trait Data<const N: usize> {
 
 #[derive(Zeroize, ZeroizeOnDrop, Clone)]
 pub struct SessionInit {
-    pub user_id: UserId,
+    #[zeroize(skip)]
+    pub remote_identity: VerifyingKey,
     pub remote_key: Option<PublicKey>,
     pub secret_key: Option<StaticSecret>,
     pub root_key: RootKey,
@@ -264,13 +271,13 @@ pub struct SessionInit {
     pub next_header_key: Option<HeaderKey>,
 }
 
-pub trait HeaderKeyStore {
+pub trait SessionKeyStore<const N: usize, D: Data<N>> {
+    fn get_verifying_key(&self) -> VerifyingKey;
+
     fn set_header_key(&self, hash_key: &HashKey, value: &HeaderKey);
     fn get_header_key(&self, hash_key: &HashKey) -> Option<HeaderKey>;
-}
 
-pub trait SessionKeyStore<const N: usize, D: Data<N>> {
-    fn set_hash_key(&self, hash_key: &HashKey, public_key: &PublicKey, session_tag: &SessionTag);
+    fn set_hash_key(&self, hash_key: &HashKey, session_tag: &SessionTag);
 
     fn set_data(&self, session: &D);
     fn get_data_by_hash(&self, hash_key: &HashKey) -> Option<D>;
