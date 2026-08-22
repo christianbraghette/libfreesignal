@@ -1,10 +1,14 @@
-use crate::{Data, HashKey, Header, HeaderKeyStore};
+use crate::{Data, HashKey, Header, HeaderError, HeaderKeyStore};
 use crate::{HeaderKey, MessageKey, RootKey, SessionInit, SessionKeyStore, SessionTag, UserId};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+type HmacSha256 = Hmac<Sha256>;
+type HkdfSha256 = Hkdf<Sha256>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DoubleRatchetError {
@@ -32,7 +36,6 @@ impl std::error::Error for DoubleRatchetError {}
 const KEY_LENGTH: usize = 32;
 const MAX_SKIP: u32 = 2000;
 const SESSION_INFO: &[u8] = b"/freesignal/double_ratchet/v0.1";
-const CHAIN_INFO: &[u8] = b"/freesignal/double_ratchet/keychain/v0.1";
 const SESSION_TAG_INFO: &[u8] = b"/freesignal/double_ratchet/tag/v0.1";
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -42,37 +45,41 @@ pub struct ChainKey(pub [u8; 32]);
 pub struct SessionHeader {
     pub count: u32,
     pub previous: u32,
-    pub remote_key: PublicKey,
+    pub public_key: PublicKey,
 }
 
-impl Header<40> for SessionHeader {
+impl Header for SessionHeader {
     fn get_public_key(&self) -> PublicKey {
-        self.remote_key
+        self.public_key
     }
 
-    fn to_bytes(&self) -> [u8; 40] {
-        let mut raw = [0u8; 40];
-        raw[0..4].copy_from_slice(&self.count.to_be_bytes());
-        raw[4..8].copy_from_slice(&self.previous.to_be_bytes());
-        raw[8..40].copy_from_slice(self.remote_key.as_bytes());
+    fn to_slice(&self) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&self.count.to_be_bytes());
+        raw.extend_from_slice(&self.previous.to_be_bytes());
+        raw.extend_from_slice(self.public_key.as_bytes());
         raw
     }
 
-    fn from_bytes(bytes: &[u8; 40]) -> Self {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, HeaderError> {
+        if bytes.len() != 40 {
+            return Err(HeaderError());
+        }
+
         let mut count = [0u8; 4];
         count.copy_from_slice(&bytes[0..4]);
 
         let mut previous = [0u8; 4];
         previous.copy_from_slice(&bytes[4..8]);
 
-        let mut remote_key = [0u8; 32];
-        remote_key.copy_from_slice(&bytes[8..40]);
+        let mut public_key = [0u8; 32];
+        public_key.copy_from_slice(&bytes[8..40]);
 
-        Self {
+        Ok(Self {
             count: u32::from_be_bytes(count),
             previous: u32::from_be_bytes(previous),
-            remote_key: PublicKey::from(remote_key),
-        }
+            public_key: PublicKey::from(public_key),
+        })
     }
 }
 
@@ -173,7 +180,7 @@ pub struct Session<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKe
 impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Session<K> {
     pub fn new(init: &SessionInit, keystore: K) -> Session<K> {
         let mut session_tag = [0u8; KEY_LENGTH];
-        let hkdf = Hkdf::<Sha256>::new(Some(&[0u8; KEY_LENGTH]), init.root_key.0.as_ref());
+        let hkdf = HkdfSha256::new(Some(&[0u8; KEY_LENGTH]), init.root_key.0.as_ref());
         hkdf.expand(SESSION_TAG_INFO, &mut session_tag)
             .expect("HKDF failed");
 
@@ -230,6 +237,14 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
         PublicKey::from(&self.current.secret_key)
     }
 
+    pub fn get_remote_hash_key(&self) -> Result<HashKey, DoubleRatchetError> {
+        self.current
+            .sending_chain
+            .as_ref()
+            .map(|c| HashKey(Sha256::digest(c.public_key.as_bytes()).into()))
+            .ok_or(DoubleRatchetError::NoSendingChain)
+    }
+
     fn init_chain(
         &mut self,
         remote_key: &PublicKey,
@@ -238,7 +253,7 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
     ) -> Result<Chain, DoubleRatchetError> {
         let shared_key = self.current.secret_key.diffie_hellman(remote_key);
         let mut hash_key = [0u8; KEY_LENGTH * 3];
-        let hkdf = Hkdf::<Sha256>::new(Some(&self.current.root_key.0), shared_key.as_bytes());
+        let hkdf = HkdfSha256::new(Some(&self.current.root_key.0), shared_key.as_bytes());
         hkdf.expand(SESSION_INFO, &mut hash_key)
             .map_err(|_| DoubleRatchetError::ChainInitFailed)?;
 
@@ -456,6 +471,7 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
                     .try_into()
                     .map_err(|_| DoubleRatchetError::InvalidHeader)?,
             )
+            .map_err(|_| DoubleRatchetError::InvalidHeader)?
         } else {
             return Err(DoubleRatchetError::InvalidHeader);
         };
@@ -487,25 +503,29 @@ pub struct Chain {
 
 impl Chain {
     fn get_key(&mut self) -> MessageKey {
-        let mut hash_key = [0u8; 64];
-        let hkdf = Hkdf::<Sha256>::new(Some(&[0u8; 32]), &self.chain_key.0);
-        hkdf.expand(CHAIN_INFO, &mut hash_key).unwrap();
+        let mut mac_msg = HmacSha256::new_from_slice(&self.chain_key.0)
+            .expect("L'HMAC accetta chiavi di qualsiasi dimensione");
+        mac_msg.update(&[0x01]);
+        let msg_key_bytes: [u8; 32] = mac_msg.finalize().into_bytes().into();
 
-        self.chain_key.0.copy_from_slice(&hash_key[..32]);
-        let mut msg_key = [0u8; 32];
-        msg_key.copy_from_slice(&hash_key[32..64]);
+        let mut mac_chain = HmacSha256::new_from_slice(&self.chain_key.0)
+            .expect("L'HMAC accetta chiavi di qualsiasi dimensione");
+        mac_chain.update(&[0x02]);
+        let next_chain_key_bytes: [u8; 32] = mac_chain.finalize().into_bytes().into();
 
-        hash_key.zeroize();
+        self.chain_key.0.zeroize();
+        self.chain_key.0.copy_from_slice(&next_chain_key_bytes);
 
         self.count += 1;
-        MessageKey(msg_key)
+
+        MessageKey(msg_key_bytes)
     }
 
     fn get_header(&self) -> SessionHeader {
         SessionHeader {
             count: self.count,
             previous: self.previous_count,
-            remote_key: self.public_key,
+            public_key: self.public_key,
         }
     }
 
@@ -813,15 +833,15 @@ mod tests {
         let header = SessionHeader {
             count: 42,
             previous: 12,
-            remote_key: PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng)),
+            public_key: PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng)),
         };
 
-        let bytes = header.to_bytes();
-        let decoded = SessionHeader::from_bytes(&bytes);
+        let bytes = header.to_slice();
+        let decoded = SessionHeader::from_bytes(&bytes).unwrap();
 
         assert_eq!(header.count, decoded.count);
         assert_eq!(header.previous, decoded.previous);
-        assert_eq!(header.remote_key.as_bytes(), decoded.remote_key.as_bytes());
+        assert_eq!(header.public_key.as_bytes(), decoded.public_key.as_bytes());
     }
 
     #[test]
@@ -874,7 +894,7 @@ mod tests {
         let fake_header = SessionHeader {
             count: super::MAX_SKIP + 1, // 2001
             previous: 0,
-            remote_key: PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng)),
+            public_key: PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng)),
         };
 
         let result = bob_session.get_receiving_key(&fake_header);
@@ -904,7 +924,7 @@ mod tests {
         let bad_header = SessionHeader {
             count: 10,
             previous: 10, // Più piccolo del count corrente nella receiving chain preesistente (50)
-            remote_key: new_remote,
+            public_key: new_remote,
         };
 
         let result = bob_session.get_receiving_key(&bad_header);

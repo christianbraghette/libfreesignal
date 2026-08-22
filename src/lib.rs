@@ -9,8 +9,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub mod double_ratchet;
-pub mod x3dh;
 pub mod node;
+pub mod x3dh;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq, Debug)]
 pub struct UserId(pub [u8; 32]);
@@ -170,16 +170,13 @@ impl std::fmt::Display for HeaderEncryptionError {
 impl std::error::Error for HeaderEncryptionError {}
 
 impl HeaderKey {
-    pub fn encrypt_header<const N: usize, H: Header<N>>(
-        &self,
-        header: &H,
-    ) -> Result<Vec<u8>, HeaderEncryptionError> {
+    pub fn encrypt_header<H: Header>(&self, header: &H) -> Result<Vec<u8>, HeaderEncryptionError> {
         let key = Key::<Aes256Gcm>::from_slice(&self.0);
         let cipher = Aes256Gcm::new(key);
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
         let ciphertext = cipher
-            .encrypt(&nonce, header.to_bytes().as_slice())
+            .encrypt(&nonce, header.to_slice().as_slice())
             .map_err(|_| HeaderEncryptionError())?;
 
         let mut output = Vec::new();
@@ -189,10 +186,7 @@ impl HeaderKey {
         Ok(output)
     }
 
-    pub fn decrypt_header<const N: usize, H: Header<N>>(
-        &self,
-        bytes: &[u8],
-    ) -> Result<H, HeaderEncryptionError> {
+    pub fn decrypt_header<H: Header>(&self, bytes: &[u8]) -> Result<H, HeaderEncryptionError> {
         let nonce = Nonce::from_slice(&bytes[..12]);
         let ciphertext_with_tag = &bytes[12..];
 
@@ -203,10 +197,7 @@ impl HeaderKey {
             .decrypt(nonce, ciphertext_with_tag)
             .map_err(|_| HeaderEncryptionError())?;
 
-        let mut raw = [0u8; N];
-        raw.copy_from_slice(&plaintext);
-
-        Ok(H::from_bytes(&raw))
+        H::from_bytes(&plaintext).map_err(|_| HeaderEncryptionError())
     }
 }
 
@@ -238,10 +229,23 @@ impl PublicIdentity {
     }
 }
 
-pub trait Header<const N: usize> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderError();
+
+impl std::fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Failed header parsing")
+    }
+}
+
+impl std::error::Error for HeaderError {}
+
+pub trait Header {
     fn get_public_key(&self) -> PublicKey;
-    fn to_bytes(&self) -> [u8; N];
-    fn from_bytes(bytes: &[u8; N]) -> Self;
+    fn to_slice(&self) -> Vec<u8>;
+    fn from_bytes(bytes: &[u8]) -> Result<Self, HeaderError>
+    where
+        Self: Sized;
 }
 
 pub trait Data<const N: usize> {
@@ -363,15 +367,15 @@ mod crypto_tests {
 
     #[derive(Clone)]
     struct DummyHeader([u8; 32]);
-    impl Header<32> for DummyHeader {
+    impl Header for DummyHeader {
         fn get_public_key(&self) -> PublicKey {
             PublicKey::from([0; 32])
         }
-        fn to_bytes(&self) -> [u8; 32] {
-            self.0
+        fn to_slice(&self) -> Vec<u8> {
+            self.0.to_vec()
         }
-        fn from_bytes(bytes: &[u8; 32]) -> Self {
-            Self(*bytes)
+        fn from_bytes(bytes: &[u8]) -> Result<Self, HeaderError> {
+            Ok(Self(*bytes.first_chunk::<32>().ok_or(HeaderError())?))
         }
     }
 
@@ -388,7 +392,7 @@ mod crypto_tests {
 
         let mut tampered = encrypted.clone();
         tampered[15] ^= 0xFF;
-        assert!(key.decrypt_header::<32, DummyHeader>(&tampered).is_err());
+        assert!(key.decrypt_header::<DummyHeader>(&tampered).is_err());
     }
 
     #[test]
