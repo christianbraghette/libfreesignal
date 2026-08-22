@@ -1,5 +1,5 @@
 use crate::{Data, HashKey, Header, HeaderError};
-use crate::{HeaderKey, MessageKey, RootKey, SessionInit, SessionKeyStore, SessionTag, UserId};
+use crate::{HeaderKey, MessageKey, RootKey, SessionInit, SessionKeyStore, SessionTag};
 use ed25519_dalek::VerifyingKey;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -84,8 +84,6 @@ impl Header for SessionHeader {
     }
 }
 
-pub const SESSION_DATA_SIZE: usize = 192 + CHAIN_SIZE * 2;
-
 #[derive(Zeroize, ZeroizeOnDrop, Clone)]
 pub struct SessionData {
     session_tag: SessionTag,
@@ -99,13 +97,13 @@ pub struct SessionData {
     receiving_chain: Option<Chain>,
 }
 
-impl Data<SESSION_DATA_SIZE> for SessionData {
+impl Data for SessionData {
     fn get_session_tag(&self) -> SessionTag {
         self.session_tag.clone()
     }
 
-    fn to_bytes(&self) -> [u8; SESSION_DATA_SIZE] {
-        let mut raw = [0u8; SESSION_DATA_SIZE];
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut raw = Vec::new();
 
         raw[..32].copy_from_slice(&self.session_tag.0);
         raw[32..64].copy_from_slice(self.remote_identity.as_bytes());
@@ -136,7 +134,7 @@ impl Data<SESSION_DATA_SIZE> for SessionData {
         raw
     }
 
-    fn from_bytes(bytes: &[u8; SESSION_DATA_SIZE]) -> Self {
+    fn from_bytes(bytes: &[u8]) -> Self {
         let mut session_tag = [0u8; 32];
         session_tag.copy_from_slice(&bytes[..32]);
         let mut remote_identity = [0u8; 32];
@@ -173,14 +171,14 @@ impl Data<SESSION_DATA_SIZE> for SessionData {
 }
 
 #[derive(Zeroize, ZeroizeOnDrop, Clone)]
-pub struct Session<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData>> {
+pub struct Session<K: SessionKeyStore<SessionData>> {
     #[zeroize(skip)]
     pub keystore: K,
     current: SessionData,
     previous: Option<SessionData>,
 }
 
-impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData>> Session<K> {
+impl<K: SessionKeyStore<SessionData>> Session<K> {
     pub fn new(init: &SessionInit, keystore: K) -> Session<K> {
         let mut session_tag = [0u8; KEY_LENGTH];
         let hkdf = HkdfSha256::new(Some(&[0u8; KEY_LENGTH]), init.root_key.0.as_ref());
@@ -509,7 +507,7 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData>> Session<K> {
         Ok((Session::from(&session_data, keystore), header))
     }
 
-    fn has_skipped_keys(&self) -> bool {
+    pub fn has_skipped_keys(&self) -> bool {
         self.keystore.has_previous_keys()
     }
 }
@@ -641,7 +639,7 @@ mod tests {
         }
     }
 
-    impl SessionKeyStore<{ SESSION_DATA_SIZE }, SessionData> for MemoryKeystore {
+    impl SessionKeyStore<SessionData> for MemoryKeystore {
         fn get_verifying_key(&self) -> VerifyingKey {
             self.local_identity
         }

@@ -185,7 +185,9 @@ impl HeaderKey {
             .encrypt(&nonce, header.to_slice().as_slice())
             .map_err(|_| HeaderEncryptionError())?;
 
-        let mut output = Vec::new();
+        derived.zeroize();
+
+        let mut output = Vec::with_capacity(12 + ciphertext.len());
         output.extend_from_slice(&nonce);
         output.extend_from_slice(&ciphertext);
 
@@ -196,8 +198,15 @@ impl HeaderKey {
         let nonce = Nonce::from_slice(&bytes[..12]);
         let ciphertext_with_tag = &bytes[12..];
 
-        let key = Key::<Aes256Gcm>::from_slice(&self.0);
+        let hkdf = Hkdf::<Sha256>::new(None, &self.0);
+        let mut derived = [0u8; 32];
+        hkdf.expand(HEADER_KEY_INFO, &mut derived)
+            .expect("HKDF size is valid");
+
+        let key = Key::<Aes256Gcm>::from_slice(&derived);
         let cipher = Aes256Gcm::new(key);
+
+        derived.zeroize();
 
         let plaintext = cipher
             .decrypt(nonce, ciphertext_with_tag)
@@ -254,10 +263,10 @@ pub trait Header {
         Self: Sized;
 }
 
-pub trait Data<const N: usize> {
+pub trait Data {
     fn get_session_tag(&self) -> SessionTag;
-    fn to_bytes(&self) -> [u8; N];
-    fn from_bytes(bytes: &[u8; N]) -> Self;
+    fn to_bytes(&self) -> Vec<u8>;
+    fn from_bytes(bytes: &[u8]) -> Self;
 }
 
 #[derive(Zeroize, ZeroizeOnDrop, Clone)]
@@ -271,7 +280,7 @@ pub struct SessionInit {
     pub next_header_key: Option<HeaderKey>,
 }
 
-pub trait SessionKeyStore<const N: usize, D: Data<N>> {
+pub trait SessionKeyStore<D: Data> {
     fn get_verifying_key(&self) -> VerifyingKey;
 
     fn set_header_key(&self, hash_key: &HashKey, value: &HeaderKey);
@@ -420,5 +429,32 @@ mod crypto_tests {
             &[0u8; 32],
             "Conversion to PublicKey must not be empty"
         );
+    }
+}
+
+pub mod xed25519 {
+    use ed25519_dalek::{SigningKey, VerifyingKey};
+    use sha2::{Digest, Sha512};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    pub fn signing_to_secret(signing_key: &SigningKey) -> StaticSecret {
+        // 1. Calcola l'hash SHA-512 dei 32 byte del seed Ed25519
+        let hash = Sha512::digest(signing_key.as_bytes());
+
+        // 2. Prendi i primi 32 byte dell'output
+        let mut scalar_bytes = [0u8; 32];
+        scalar_bytes.copy_from_slice(&hash[..32]);
+
+        // 3. Clamping esplicito secondo la specifica Curve25519 / XEd25519
+        scalar_bytes[0] &= 248; // Azzera i 3 bit meno significativi (gestione del cofattore 8)
+        scalar_bytes[31] &= 127; // Azzera il bit 255
+        scalar_bytes[31] |= 64; // Imposta il bit 254 a 1
+
+        StaticSecret::from(scalar_bytes)
+    }
+
+    pub fn verifying_to_public(verifying_key: &VerifyingKey) -> PublicKey {
+        let montgomery_point = verifying_key.to_montgomery();
+        PublicKey::from(montgomery_point.to_bytes())
     }
 }

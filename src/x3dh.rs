@@ -1,8 +1,8 @@
-use crate::{HeaderKey, KeyExchangeStore, PublicIdentity, RootKey, SessionInit};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use crate::{xed25519, HeaderKey, KeyExchangeStore, RootKey, SessionInit};
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
 use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
@@ -26,13 +26,6 @@ impl std::fmt::Display for KeyExchangeError {
     }
 }
 impl std::error::Error for KeyExchangeError {}
-
-pub fn get_identity_x25519_secret(signing_key: &SigningKey) -> StaticSecret {
-    let hash = Sha512::digest(signing_key.as_bytes());
-    let mut scalar_bytes = [0u8; 32];
-    scalar_bytes.copy_from_slice(&hash[..32]);
-    StaticSecret::from(scalar_bytes)
-}
 
 #[derive(Clone)]
 pub struct PreKeyBundle<const N: usize> {
@@ -130,8 +123,6 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
             .verify_strict(bundle.signed_pre_key.as_ref(), &bundle.signature)
             .map_err(|_| KeyExchangeError::VerificationError)?;
 
-        let remote_user_id = PublicIdentity(bundle.identity_key).get_user_id();
-
         let onetime_pre_key = bundle.onetime_pre_keys.as_ref().and_then(|keys| {
             if keys.is_empty() {
                 None
@@ -149,7 +140,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 
         raw[..KEY_LENGTH].copy_from_slice(&PREFIX_F);
 
-        let identity_x25519_secret = get_identity_x25519_secret(&self.keystore.get_signing_key());
+        let identity_x25519_secret = xed25519::signing_to_secret(&self.keystore.get_signing_key());
 
         raw[KEY_LENGTH..KEY_LENGTH * 2].copy_from_slice(
             identity_x25519_secret
@@ -203,8 +194,6 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
         &self,
         message: PreKeyMessage,
     ) -> Result<SessionInit, KeyExchangeError> {
-        let remote_user_id = PublicIdentity(message.identity_key).get_user_id();
-
         let signed_pre_key = self
             .keystore
             .load_pre_key(&message.signed_pre_key_hash)
@@ -233,7 +222,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 
         raw[..KEY_LENGTH].copy_from_slice(&PREFIX_F);
 
-        let identity_x25519_secret = get_identity_x25519_secret(&self.keystore.get_signing_key());
+        let identity_x25519_secret = xed25519::signing_to_secret(&self.keystore.get_signing_key());
 
         raw[KEY_LENGTH..KEY_LENGTH * 2].copy_from_slice(
             signed_pre_key
@@ -283,7 +272,7 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::double_ratchet::{SESSION_DATA_SIZE, SessionData};
+    use crate::double_ratchet::{SessionData};
     use crate::{Data, HashKey, MessageKey, SessionKeyStore, SessionTag};
     use ed25519_dalek::SigningKey;
     use rand_core::OsRng;
@@ -350,7 +339,7 @@ mod tests {
         }
     }
 
-    impl SessionKeyStore<{ SESSION_DATA_SIZE }, SessionData> for MemorySessionKeystore {
+    impl SessionKeyStore<SessionData> for MemorySessionKeystore {
         fn get_verifying_key(&self) -> VerifyingKey {
             self.local_identity
         }
@@ -394,11 +383,7 @@ mod tests {
                 .insert(session.get_session_tag(), session.clone());
         }
 
-        fn set_hash_key(
-            &self,
-            hash_key: &HashKey,
-            session_tag: &SessionTag,
-        ) {
+        fn set_hash_key(&self, hash_key: &HashKey, session_tag: &SessionTag) {
             self.session_tag_map
                 .borrow_mut()
                 .insert(hash_key.clone(), session_tag.clone());
