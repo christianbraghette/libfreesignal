@@ -204,11 +204,6 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
 
         session_tag.zeroize();
 
-        if let Some(ref nhk) = init.next_header_key {
-            let hash = HashKey(Sha256::digest(session.get_public_key().as_bytes()).into());
-            session.keystore.set_header_key(&hash, nhk);
-        }
-
         if let Some(remote_key) = init.remote_key {
             session.current.sending_chain = Some(
                 session
@@ -371,7 +366,8 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
                     self.keystore.set_previous_keys(&session_tag, &key);
                 }
                 previous_count = Some(rc.count);
-                rc_header_key = rc_header_key.or(rc.header_key.clone())
+
+                rc_header_key = rc_header_key.or(Some(rc.next_header_key.clone()));
             }
 
             let new_rc = self.init_chain(
@@ -381,15 +377,21 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
             )?;
             self.current.receiving_chain = Some(new_rc.clone());
 
-            let hash: [u8; 32] = Sha256::digest(self.get_public_key().as_bytes()).into();
+            self.current.secret_key = StaticSecret::random_from_rng(rand_core::OsRng);
+            let new_pub_key = self.get_public_key();
+            let hash: [u8; 32] = Sha256::digest(new_pub_key.as_bytes()).into();
+
+            if let Some(old_nhk) = &rc_header_key {
+                self.keystore
+                    .set_header_key(&HashKey(hash.clone()), old_nhk);
+            }
+
             self.keystore
-                .set_header_key(&HashKey(hash), &new_rc.next_header_key);
+                .set_hash_key(&HashKey(hash), &new_pub_key, &session_tag);
 
             if self.current.next_header_key.is_some() {
                 self.current.next_header_key = None;
             }
-
-            self.current.secret_key = StaticSecret::random_from_rng(rand_core::OsRng);
 
             let old_sending_chain = self.current.sending_chain.clone();
             let sending_chain_count = old_sending_chain.as_ref().map(|c| c.count).unwrap_or(0);
@@ -430,7 +432,10 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
         }
     }
 
-    pub fn from_header(bytes: &[u8], keystore: K) -> Result<Self, DoubleRatchetError> {
+    pub fn from_header(
+        bytes: &[u8],
+        keystore: K,
+    ) -> Result<(Self, SessionHeader), DoubleRatchetError> {
         let mut hash_key = [0u8; 32];
         hash_key.copy_from_slice(&bytes[..32]);
 
@@ -456,10 +461,10 @@ impl<K: SessionKeyStore<SESSION_DATA_SIZE, SessionData> + HeaderKeyStore> Sessio
         };
 
         let session_data = keystore
-            .get_data_by_hash(&HashKey(Sha256::digest(&header.remote_key).into()))
+            .get_data_by_hash(&HashKey(hash_key.clone())) // Usa il prefisso originale
             .ok_or(DoubleRatchetError::SessionNotFound)?;
 
-        Ok(Session::from(&session_data, keystore))
+        Ok((Session::from(&session_data, keystore), header))
     }
 
     fn has_skipped_keys(&self) -> bool {
@@ -841,7 +846,10 @@ mod tests {
 
         assert_eq!(session.current.session_tag.0, decoded.session_tag.0);
         assert_eq!(session.current.user_id.0, decoded.user_id.0);
-        assert_eq!(session.current.secret_key.to_bytes(), decoded.secret_key.to_bytes());
+        assert_eq!(
+            session.current.secret_key.to_bytes(),
+            decoded.secret_key.to_bytes()
+        );
         assert_eq!(session.current.root_key.0, decoded.root_key.0);
         assert_eq!(session.current.header_key, decoded.header_key);
         assert_eq!(session.current.next_header_key, decoded.next_header_key);
