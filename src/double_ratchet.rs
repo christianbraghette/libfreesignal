@@ -5,7 +5,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use x25519_dalek::{PublicKey, StaticSecret};
+use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -38,9 +38,6 @@ const KEY_LENGTH: usize = 32;
 const MAX_SKIP: u32 = 2000;
 const SESSION_INFO: &[u8] = b"/freesignal/double_ratchet/v0.1";
 const SESSION_TAG_INFO: &[u8] = b"/freesignal/double_ratchet/v0.1/tag";
-
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub struct ChainKey(pub [u8; 32]);
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SessionHeader {
@@ -84,8 +81,65 @@ impl Header for SessionHeader {
     }
 }
 
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct ChainKey([u8; 32]);
+
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
 pub struct RootKey([u8; 32]);
+
+impl RootKey {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn expand(
+        &mut self,
+        session_tag: &SessionTag,
+        local_identity: &VerifyingKey,
+        remote_identity: &VerifyingKey,
+        shared_key: &SharedSecret,
+    ) -> Result<(ChainKey, HeaderKey), DoubleRatchetError> {
+        let (key_1, key_2) = if local_identity.as_bytes() < remote_identity.as_bytes() {
+            (local_identity.as_bytes(), remote_identity.as_bytes())
+        } else {
+            (remote_identity.as_bytes(), local_identity.as_bytes())
+        };
+
+        let mut info_buf = [0u8; 128];
+        let mut offset = 0;
+
+        info_buf[offset..offset + SESSION_INFO.len()].copy_from_slice(SESSION_INFO);
+        offset += SESSION_INFO.len();
+
+        info_buf[offset..offset + 32].copy_from_slice(&session_tag.0);
+        offset += 32;
+
+        info_buf[offset..offset + 32].copy_from_slice(key_1);
+        offset += 32;
+
+        info_buf[offset..offset + 32].copy_from_slice(key_2);
+        offset += 32;
+
+        let mut hash_key = [0u8; KEY_LENGTH * 3];
+        let hkdf = HkdfSha256::new(Some(&self.0), shared_key.as_bytes());
+        hkdf.expand(&info_buf[..offset], &mut hash_key)
+            .map_err(|_| DoubleRatchetError::ChainInitFailed)?;
+
+        info_buf.zeroize();
+
+        self.0.copy_from_slice(&hash_key[0..32]);
+
+        let mut chain_val = [0u8; 32];
+        chain_val.copy_from_slice(&hash_key[32..64]);
+
+        let mut hk_val = [0u8; 32];
+        hk_val.copy_from_slice(&hash_key[64..96]);
+
+        hash_key.zeroize();
+
+        Ok((ChainKey(chain_val), HeaderKey(hk_val)))
+    }
+}
 
 #[derive(Zeroize, ZeroizeOnDrop, Clone)]
 pub struct SessionData {
@@ -219,7 +273,7 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
         if let Some(remote_key) = init.remote_key {
             session.current.sending_chain = Some(
                 session
-                    .init_chain(
+                    .expand(
                         &remote_key,
                         init.header_key.map(|hk| HeaderKey(hk)).as_ref(),
                         None,
@@ -250,9 +304,9 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
             .ok_or(DoubleRatchetError::NoSendingChain)
     }
 
-    fn init_chain(
+    fn expand(
         &mut self,
-        remote_key: &PublicKey, // Rinominato per chiarezza
+        remote_key: &PublicKey,
         header_key: Option<&HeaderKey>,
         previous_count: Option<u32>,
     ) -> Result<Chain, DoubleRatchetError> {
@@ -261,54 +315,23 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
         let local_identity = self.keystore.get_verifying_key();
         let remote_identity = &self.current.remote_identity;
 
-        let (key_1, key_2) = if local_identity.as_bytes() < remote_identity.as_bytes() {
-            (local_identity.as_bytes(), remote_identity.as_bytes())
-        } else {
-            (remote_identity.as_bytes(), local_identity.as_bytes())
-        };
-
-        // 2. Costruiamo l'Associated Data (AD) sullo stack per evitare allocazioni.
-        // Calcolo dimensione: 31 (SESSION_INFO) + 32 (SessionTag) + 32 (Id_1) + 32 (Id_2) = 127 byte
-        let mut info_buf = [0u8; 128];
-        let mut offset = 0;
-
-        info_buf[offset..offset + SESSION_INFO.len()].copy_from_slice(SESSION_INFO);
-        offset += SESSION_INFO.len();
-
-        info_buf[offset..offset + 32].copy_from_slice(&self.current.session_tag.0);
-        offset += 32;
-
-        info_buf[offset..offset + 32].copy_from_slice(key_1);
-        offset += 32;
-
-        info_buf[offset..offset + 32].copy_from_slice(key_2);
-        offset += 32;
-
-        let mut hash_key = [0u8; KEY_LENGTH * 3];
-        let hkdf = HkdfSha256::new(Some(&self.current.root_key.0), shared_key.as_bytes());
-        hkdf.expand(&info_buf[..offset], &mut hash_key)
+        let (chain_key, next_header_key) = self
+            .current
+            .root_key
+            .expand(
+                &self.get_session_tag(),
+                &local_identity,
+                remote_identity,
+                &shared_key,
+            )
             .map_err(|_| DoubleRatchetError::ChainInitFailed)?;
-
-        info_buf.zeroize();
-
-        let mut root_val = [0u8; 32];
-        let mut chain_val = [0u8; 32];
-        let mut next_h_val = [0u8; 32];
-
-        root_val.copy_from_slice(&hash_key[0..32]);
-        chain_val.copy_from_slice(&hash_key[32..64]);
-        next_h_val.copy_from_slice(&hash_key[64..96]);
-
-        hash_key.zeroize();
-
-        self.current.root_key = RootKey(root_val);
 
         let chain = Chain {
             count: 0,
             public_key: PublicKey::from(&self.current.secret_key),
             remote_key: *remote_key,
-            chain_key: ChainKey(chain_val),
-            next_header_key: HeaderKey(next_h_val),
+            chain_key,
+            next_header_key,
             header_key: header_key.cloned(),
             previous_count: previous_count.unwrap_or(0),
         };
@@ -419,7 +442,7 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
                 rc_header_key = rc_header_key.or(Some(rc.next_header_key.clone()));
             }
 
-            let new_rc = self.init_chain(
+            let new_rc = self.expand(
                 &header.get_public_key(),
                 rc_header_key.as_ref(),
                 previous_count,
@@ -446,7 +469,7 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
             let sc_next_hk = old_sending_chain.map(|c| c.next_header_key.clone());
             let sc_header_key = self.current.header_key.clone().or(sc_next_hk);
 
-            self.current.sending_chain = Some(self.init_chain(
+            self.current.sending_chain = Some(self.expand(
                 &header.get_public_key(),
                 sc_header_key.as_ref(),
                 Some(sending_chain_count),
@@ -888,8 +911,7 @@ mod tests {
         let mut session = Session::new(&bob_init, bob_keystore);
 
         let fake_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
-        session.current.sending_chain =
-            Some(session.init_chain(&fake_remote, None, Some(5)).unwrap());
+        session.current.sending_chain = Some(session.expand(&fake_remote, None, Some(5)).unwrap());
 
         let bytes = session.current.to_bytes();
         let decoded = SessionData::from_bytes(&bytes);
@@ -953,7 +975,7 @@ mod tests {
         let mut bob_session = Session::new(&bob_init, bob_keystore.clone());
 
         let old_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
-        let mut mock_rc = bob_session.init_chain(&old_remote, None, None).unwrap();
+        let mut mock_rc = bob_session.expand(&old_remote, None, None).unwrap();
         mock_rc.count = 50;
         bob_session.current.receiving_chain = Some(mock_rc);
 
@@ -987,7 +1009,7 @@ mod tests {
         let initial_root = session.current.root_key.clone();
 
         let fake_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
-        let new_chain = session.init_chain(&fake_remote, None, None).unwrap();
+        let new_chain = session.expand(&fake_remote, None, None).unwrap();
         session.current.receiving_chain = Some(new_chain);
 
         assert_ne!(session.current.root_key.0, initial_root.0);
