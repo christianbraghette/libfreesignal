@@ -22,7 +22,7 @@ pub struct HashKey(pub [u8; 32]);
 pub struct SessionTag(pub [u8; 32]);
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, Hash, PartialEq)]
-pub struct MessageKey(pub [u8; 32]);
+pub struct MessageKey(Option<[u8; 32]>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageEncryptionError();
@@ -39,8 +39,23 @@ const PAD_BLOCK_SIZE: usize = 128;
 const MESSAGE_KEY_INFO: &[u8] = b"/freesignal/encryption/v0.1/message";
 
 impl MessageKey {
-    fn derive_crypto_material(&self) -> ([u8; 32], [u8; 12]) {
-        let hkdf = Hkdf::<Sha256>::new(None, &self.0);
+    pub fn new(key: [u8; 32]) -> Self {
+        Self(Some(key))
+    }
+
+    fn unwrap(&mut self) -> Option<[u8; 32]> {
+        self.0
+            .as_mut()
+            .map(|key| {
+                let raw = key.clone();
+                key.zeroize();
+                Some(raw)
+            })
+            .flatten()
+    }
+
+    fn derive_crypto_material(&mut self) -> Result<([u8; 32], [u8; 12]), MessageEncryptionError> {
+        let hkdf = Hkdf::<Sha256>::new(None, &self.unwrap().ok_or(MessageEncryptionError())?);
         let mut derived = [0u8; 44];
         hkdf.expand(MESSAGE_KEY_INFO, &mut derived)
             .expect("HKDF size is valid");
@@ -52,15 +67,15 @@ impl MessageKey {
 
         derived.zeroize();
 
-        (key, nonce)
+        Ok((key, nonce))
     }
 
     pub fn encrypt_payload(
-        &self,
+        &mut self,
         plaintext: &[u8],
         associated_data: &[u8],
     ) -> Result<Vec<u8>, MessageEncryptionError> {
-        let (key, nonce) = self.derive_crypto_material();
+        let (key, nonce) = self.derive_crypto_material()?;
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| MessageEncryptionError())?;
         let nonce = Nonce::from_slice(&nonce);
 
@@ -75,11 +90,11 @@ impl MessageKey {
     }
 
     pub fn decrypt_payload(
-        &self,
+        &mut self,
         ciphertext: &[u8],
         associated_data: &[u8],
     ) -> Result<Vec<u8>, MessageEncryptionError> {
-        let (key, nonce) = self.derive_crypto_material();
+        let (key, nonce) = self.derive_crypto_material()?;
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| MessageEncryptionError())?;
         let nonce = Nonce::from_slice(&nonce);
 
@@ -133,7 +148,7 @@ impl MessageKey {
     }
 
     pub fn encrypt_padded_payload(
-        &self,
+        &mut self,
         plaintext: &[u8],
         associated_data: &[u8],
     ) -> Result<Vec<u8>, MessageEncryptionError> {
@@ -142,7 +157,7 @@ impl MessageKey {
     }
 
     pub fn decrypt_padded_payload(
-        &self,
+        &mut self,
         ciphertext: &[u8],
         associated_data: &[u8],
     ) -> Result<Vec<u8>, MessageEncryptionError> {
@@ -361,7 +376,7 @@ mod crypto_tests {
 
     #[test]
     fn test_payload_encryption_decryption() {
-        let key = MessageKey([0xAA; 32]);
+        let mut key = MessageKey::new([0xAA; 32]);
         let plaintext = b"Secret data";
         let aad = b"Associated Data Context";
 

@@ -116,7 +116,7 @@ impl ChainKey {
 
         self.count += 1;
 
-        MessageKey(msg_key_bytes)
+        MessageKey::new(msg_key_bytes)
     }
 
     pub fn compare(&self, remote_key: &PublicKey) -> bool {
@@ -919,11 +919,11 @@ mod tests {
         };
 
         let mut session = Session::new(&init, keystore);
-        let (msg_key, header, header_key) = session.get_sending_key().unwrap();
+        let (mut msg_key, header, header_key) = session.get_sending_key().unwrap();
 
         assert_eq!(header.count, 1);
         assert_eq!(header_key.map(|d| d.0), Some(initial_header_key));
-        assert_ne!(msg_key.0, [0u8; 32]);
+        assert_ne!(msg_key.unwrap(), Some([0u8; 32]));
     }
 
     #[test]
