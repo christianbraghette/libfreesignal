@@ -181,20 +181,26 @@ impl MessageKey {
 pub struct HeaderKey([u8; 32]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeaderEncryptionError();
+pub enum HeaderKeyError {
+    Encryption,
+    Decryption,
+}
 
-impl std::fmt::Display for HeaderEncryptionError {
+impl std::fmt::Display for HeaderKeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Failed crypto operation")
+        match self {
+            Self::Encryption => write!(f, "Error during encryption"),
+            Self::Decryption => write!(f, "Error during decryption"),
+        }
     }
 }
 
-impl std::error::Error for HeaderEncryptionError {}
+impl std::error::Error for HeaderKeyError {}
 
 const HEADER_KEY_INFO: &[u8] = b"/freesignal/encryption/v0.1/header";
 
 impl HeaderKey {
-    pub fn encrypt_header<H: Header>(&self, header: &H) -> Result<Vec<u8>, HeaderEncryptionError> {
+    pub fn encrypt_header<H: Header>(&self, header: &H) -> Result<Vec<u8>, HeaderKeyError> {
         let hkdf = Hkdf::<Sha256>::new(None, &self.0);
         let mut derived = [0u8; 32];
         hkdf.expand(HEADER_KEY_INFO, &mut derived)
@@ -206,7 +212,7 @@ impl HeaderKey {
 
         let ciphertext = cipher
             .encrypt(&nonce, header.to_slice().as_slice())
-            .map_err(|_| HeaderEncryptionError())?;
+            .map_err(|_| HeaderKeyError::Encryption)?;
 
         derived.zeroize();
 
@@ -217,7 +223,7 @@ impl HeaderKey {
         Ok(output)
     }
 
-    pub fn decrypt_header<H: Header>(&self, bytes: &[u8]) -> Result<H, HeaderEncryptionError> {
+    pub fn decrypt_header<H: Header>(&self, bytes: &[u8]) -> Result<H, HeaderKeyError> {
         let nonce = Nonce::from_slice(&bytes[..12]);
         let ciphertext_with_tag = &bytes[12..];
 
@@ -233,9 +239,9 @@ impl HeaderKey {
 
         let plaintext = cipher
             .decrypt(nonce, ciphertext_with_tag)
-            .map_err(|_| HeaderEncryptionError())?;
+            .map_err(|_| HeaderKeyError::Decryption)?;
 
-        H::from_bytes(&plaintext).map_err(|_| HeaderEncryptionError())
+        H::from_bytes(&plaintext).map_err(|_| HeaderKeyError::Decryption)
     }
 }
 
@@ -331,6 +337,30 @@ pub trait KeyExchangeStore {
     fn store_pre_key(&self, prekey_hash: &[u8], prekey: &StaticSecret);
     fn load_pre_key(&self, prekey_hash: &[u8]) -> Option<StaticSecret>;
     fn remove_pre_key(&self, prekey_hash: &[u8]) -> bool;
+}
+
+pub mod xed25519 {
+    use ed25519_dalek::{SigningKey, VerifyingKey};
+    use sha2::{Digest, Sha512};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    pub fn signing_to_secret(signing_key: &SigningKey) -> StaticSecret {
+        let hash = Sha512::digest(signing_key.as_bytes());
+
+        let mut scalar_bytes = [0u8; 32];
+        scalar_bytes.copy_from_slice(&hash[..32]);
+
+        scalar_bytes[0] &= 248; // Azzera i 3 bit meno significativi (gestione del cofattore 8)
+        scalar_bytes[31] &= 127; // Azzera il bit 255
+        scalar_bytes[31] |= 64; // Imposta il bit 254 a 1
+
+        StaticSecret::from(scalar_bytes)
+    }
+
+    pub fn verifying_to_public(verifying_key: &VerifyingKey) -> PublicKey {
+        let montgomery_point = verifying_key.to_montgomery();
+        PublicKey::from(montgomery_point.to_bytes())
+    }
 }
 
 #[cfg(test)]
@@ -458,29 +488,5 @@ mod crypto_tests {
             &[0u8; 32],
             "Conversion to PublicKey must not be empty"
         );
-    }
-}
-
-pub mod xed25519 {
-    use ed25519_dalek::{SigningKey, VerifyingKey};
-    use sha2::{Digest, Sha512};
-    use x25519_dalek::{PublicKey, StaticSecret};
-
-    pub fn signing_to_secret(signing_key: &SigningKey) -> StaticSecret {
-        let hash = Sha512::digest(signing_key.as_bytes());
-
-        let mut scalar_bytes = [0u8; 32];
-        scalar_bytes.copy_from_slice(&hash[..32]);
-
-        scalar_bytes[0] &= 248; // Azzera i 3 bit meno significativi (gestione del cofattore 8)
-        scalar_bytes[31] &= 127; // Azzera il bit 255
-        scalar_bytes[31] |= 64; // Imposta il bit 254 a 1
-
-        StaticSecret::from(scalar_bytes)
-    }
-
-    pub fn verifying_to_public(verifying_key: &VerifyingKey) -> PublicKey {
-        let montgomery_point = verifying_key.to_montgomery();
-        PublicKey::from(montgomery_point.to_bytes())
     }
 }
