@@ -923,7 +923,7 @@ mod tests {
 
         assert_eq!(header.count, 1);
         assert_eq!(header_key.map(|d| d.0), Some(initial_header_key));
-        assert_ne!(msg_key.unwrap(), Some([0u8; 32]));
+        assert_ne!(msg_key.unwrap().unwrap(), [0u8; 32]);
     }
 
     #[test]

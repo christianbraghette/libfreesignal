@@ -25,15 +25,25 @@ pub struct SessionTag(pub [u8; 32]);
 pub struct MessageKey(Option<[u8; 32]>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MessageEncryptionError();
+pub enum MessageKeyError {
+    KeyReused,
+    Encryption,
+    Decryption,
+    EncryptionPadding,
+}
 
-impl std::fmt::Display for MessageEncryptionError {
+impl std::fmt::Display for MessageKeyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Failed crypto operation")
+        match self {
+            Self::KeyReused => write!(f, "Key reused"),
+            Self::Encryption => write!(f, "Error during encryption"),
+            Self::Decryption => write!(f, "Error during decryption"),
+            Self::EncryptionPadding => write!(f, "Error parsing padding"),
+        }
     }
 }
 
-impl std::error::Error for MessageEncryptionError {}
+impl std::error::Error for MessageKeyError {}
 
 const PAD_BLOCK_SIZE: usize = 128;
 const MESSAGE_KEY_INFO: &[u8] = b"/freesignal/encryption/v0.1/message";
@@ -43,7 +53,7 @@ impl MessageKey {
         Self(Some(key))
     }
 
-    fn unwrap(&mut self) -> Option<[u8; 32]> {
+    pub fn unwrap(&mut self) -> Result<[u8; 32], MessageKeyError> {
         self.0
             .as_mut()
             .map(|key| {
@@ -52,10 +62,11 @@ impl MessageKey {
                 Some(raw)
             })
             .flatten()
+            .ok_or(MessageKeyError::KeyReused)
     }
 
-    fn derive_crypto_material(&mut self) -> Result<([u8; 32], [u8; 12]), MessageEncryptionError> {
-        let hkdf = Hkdf::<Sha256>::new(None, &self.unwrap().ok_or(MessageEncryptionError())?);
+    fn derive_crypto_material(&mut self) -> Result<([u8; 32], [u8; 12]), MessageKeyError> {
+        let hkdf = Hkdf::<Sha256>::new(None, &self.unwrap()?);
         let mut derived = [0u8; 44];
         hkdf.expand(MESSAGE_KEY_INFO, &mut derived)
             .expect("HKDF size is valid");
@@ -74,9 +85,9 @@ impl MessageKey {
         &mut self,
         plaintext: &[u8],
         associated_data: &[u8],
-    ) -> Result<Vec<u8>, MessageEncryptionError> {
+    ) -> Result<Vec<u8>, MessageKeyError> {
         let (key, nonce) = self.derive_crypto_material()?;
-        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| MessageEncryptionError())?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| MessageKeyError::Encryption)?;
         let nonce = Nonce::from_slice(&nonce);
 
         let payload = aes_gcm::aead::Payload {
@@ -86,16 +97,16 @@ impl MessageKey {
 
         cipher
             .encrypt(&nonce, payload)
-            .map_err(|_| MessageEncryptionError())
+            .map_err(|_| MessageKeyError::Encryption)
     }
 
     pub fn decrypt_payload(
         &mut self,
         ciphertext: &[u8],
         associated_data: &[u8],
-    ) -> Result<Vec<u8>, MessageEncryptionError> {
+    ) -> Result<Vec<u8>, MessageKeyError> {
         let (key, nonce) = self.derive_crypto_material()?;
-        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| MessageEncryptionError())?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| MessageKeyError::Decryption)?;
         let nonce = Nonce::from_slice(&nonce);
 
         let payload = aes_gcm::aead::Payload {
@@ -105,7 +116,7 @@ impl MessageKey {
 
         cipher
             .decrypt(&nonce, payload)
-            .map_err(|_| MessageEncryptionError())
+            .map_err(|_| MessageKeyError::Decryption)
     }
 
     fn pad_plaintext(plaintext: &[u8]) -> Vec<u8> {
@@ -120,9 +131,9 @@ impl MessageKey {
         padded
     }
 
-    fn unpad_plaintext(padded: &[u8]) -> Result<Vec<u8>, MessageEncryptionError> {
+    fn unpad_plaintext(padded: &[u8]) -> Result<Vec<u8>, MessageKeyError> {
         if padded.is_empty() || padded.len() % PAD_BLOCK_SIZE != 0 {
-            return Err(MessageEncryptionError());
+            return Err(MessageKeyError::EncryptionPadding);
         }
 
         let mut pad_len: usize = 0;
@@ -140,7 +151,7 @@ impl MessageKey {
         }
 
         if pad_len == 0 {
-            return Err(MessageEncryptionError());
+            return Err(MessageKeyError::EncryptionPadding);
         }
 
         let original_len = padded.len() - pad_len;
@@ -151,7 +162,7 @@ impl MessageKey {
         &mut self,
         plaintext: &[u8],
         associated_data: &[u8],
-    ) -> Result<Vec<u8>, MessageEncryptionError> {
+    ) -> Result<Vec<u8>, MessageKeyError> {
         let padded_plaintext = Self::pad_plaintext(plaintext);
         self.encrypt_payload(&padded_plaintext, associated_data)
     }
@@ -160,7 +171,7 @@ impl MessageKey {
         &mut self,
         ciphertext: &[u8],
         associated_data: &[u8],
-    ) -> Result<Vec<u8>, MessageEncryptionError> {
+    ) -> Result<Vec<u8>, MessageKeyError> {
         let padded_plaintext = self.decrypt_payload(ciphertext, associated_data)?;
         Self::unpad_plaintext(&padded_plaintext)
     }
@@ -327,18 +338,6 @@ mod crypto_tests {
     use super::*;
 
     #[test]
-    fn test_error_display_formatting() {
-        assert_eq!(
-            format!("{}", MessageEncryptionError()),
-            "Failed crypto operation"
-        );
-        assert_eq!(
-            format!("{}", HeaderEncryptionError()),
-            "Failed crypto operation"
-        );
-    }
-
-    #[test]
     fn test_padding_and_unpadding_valid() {
         let plaintext = b"Hello Signal Protocol";
         let padded = MessageKey::pad_plaintext(plaintext);
@@ -376,23 +375,39 @@ mod crypto_tests {
 
     #[test]
     fn test_payload_encryption_decryption() {
-        let mut key = MessageKey::new([0xAA; 32]);
+        let mut encrypt_key = MessageKey::new([0xAA; 32]);
+        let mut decrypt_key1 = encrypt_key.clone();
+        let mut decrypt_key2 = encrypt_key.clone();
+        let mut decrypt_key3 = encrypt_key.clone();
         let plaintext = b"Secret data";
         let aad = b"Associated Data Context";
 
-        let ciphertext = key.encrypt_padded_payload(plaintext, aad).unwrap();
+        let ciphertext = encrypt_key.encrypt_padded_payload(plaintext, aad).unwrap();
 
-        let decrypted = key.decrypt_padded_payload(&ciphertext, aad).unwrap();
+        assert!(
+            encrypt_key
+                .decrypt_padded_payload(&ciphertext, aad)
+                .is_err()
+        );
+
+        let decrypted = decrypt_key1
+            .decrypt_padded_payload(&ciphertext, aad)
+            .unwrap();
         assert_eq!(plaintext.as_slice(), decrypted);
 
         assert!(
-            key.decrypt_padded_payload(&ciphertext, b"Wrong Context")
+            decrypt_key2
+                .decrypt_padded_payload(&ciphertext, b"Wrong Context")
                 .is_err()
         );
 
         let mut corrupted = ciphertext.clone();
         corrupted[0] ^= 0xFF;
-        assert!(key.decrypt_padded_payload(&corrupted, aad).is_err());
+        assert!(
+            decrypt_key3
+                .decrypt_padded_payload(&corrupted, aad)
+                .is_err()
+        );
     }
 
     #[derive(Clone)]
