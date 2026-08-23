@@ -411,11 +411,11 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
                     key: init.root_key,
                 },
                 sending_header_keys: init
-                    .header_key
+                    .sending_header_key
                     .map(|hk| HeaderKeys::new(HeaderKey(hk)))
                     .unwrap_or_default(),
                 receiving_header_keys: init
-                    .next_header_key
+                    .receiving_header_key
                     .map(|hk| HeaderKeys::new(HeaderKey(hk)))
                     .unwrap_or_default(),
                 sending_chain_key: None,
@@ -804,8 +804,8 @@ mod tests {
             remote_key: None,
             root_key: shared_root_key,
             secret_key: None,
-            header_key: None,
-            next_header_key: None,
+            sending_header_key: None,
+            receiving_header_key: None,
         };
         let mut bob_session = Session::new(&bob_init, bob_keystore);
         let bob_public_key = bob_session.public_key();
@@ -816,8 +816,8 @@ mod tests {
             remote_key: Some(bob_public_key),
             secret_key: None,
             root_key: shared_root_key,
-            header_key: None,
-            next_header_key: None,
+            sending_header_key: None,
+            receiving_header_key: None,
         };
         let mut alice_session = Session::new(&alice_init, alice_keystore);
 
@@ -865,8 +865,8 @@ mod tests {
             remote_key: None,
             secret_key: None,
             root_key: shared_root_key,
-            header_key: None,
-            next_header_key: None,
+            sending_header_key: None,
+            receiving_header_key: None,
         };
         let mut bob_session = Session::new(&bob_init, bob_keystore);
         let bob_public_key = bob_session.public_key();
@@ -877,8 +877,8 @@ mod tests {
             remote_key: Some(bob_public_key),
             secret_key: None,
             root_key: shared_root_key,
-            header_key: None,
-            next_header_key: None,
+            sending_header_key: None,
+            receiving_header_key: None,
         };
         let mut alice_session = Session::new(&alice_init, alice_keystore);
 
@@ -916,8 +916,8 @@ mod tests {
             remote_key: Some(bob_pubkey),
             root_key: shared_root_key,
             secret_key: Some(bob_secret),
-            header_key: Some(initial_header_key),
-            next_header_key: None,
+            sending_header_key: Some(initial_header_key),
+            receiving_header_key: None,
         };
 
         let mut session = Session::new(&init, keystore);
@@ -970,8 +970,8 @@ mod tests {
             remote_key: None,
             root_key: [2u8; 32],
             secret_key: None,
-            header_key: Some([3u8; 32]),
-            next_header_key: None,
+            sending_header_key: Some([3u8; 32]),
+            receiving_header_key: None,
         };
         let mut session = Session::new(&bob_init, bob_keystore);
 
@@ -1014,8 +1014,8 @@ mod tests {
             remote_key: None,
             secret_key: None,
             root_key: shared_root_key,
-            header_key: None,
-            next_header_key: None,
+            sending_header_key: None,
+            receiving_header_key: None,
         };
         let mut bob_session = Session::new(&bob_init, bob_keystore);
 
@@ -1040,8 +1040,8 @@ mod tests {
             remote_key: None,
             secret_key: None,
             root_key: shared_root_key,
-            header_key: None,
-            next_header_key: None,
+            sending_header_key: None,
+            receiving_header_key: None,
         };
         let mut bob_session = Session::new(&bob_init, bob_keystore);
 
@@ -1072,8 +1072,8 @@ mod tests {
             remote_key: None,
             root_key: [2u8; 32],
             secret_key: None,
-            header_key: None,
-            next_header_key: None,
+            sending_header_key: None,
+            receiving_header_key: None,
         };
         let mut session = Session::new(&init, bob_keystore);
 

@@ -178,8 +178,8 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
                 remote_key: Some(bundle.signed_pre_key),
                 secret_key: None,
                 root_key,
-                header_key: Some(header_key),
-                next_header_key: Some(next_header_key),
+                sending_header_key: Some(header_key),
+                receiving_header_key: Some(next_header_key),
             },
             PreKeyMessage {
                 identity_key: self.identity,
@@ -263,8 +263,8 @@ impl<K: KeyExchangeStore> KeyExchange<K> {
             remote_key: None,
             secret_key: Some(signed_pre_key),
             root_key,
-            header_key: Some(header_key),
-            next_header_key: Some(next_header_key),
+            sending_header_key: Some(header_key),
+            receiving_header_key: Some(next_header_key),
         })
     }
 }
@@ -467,8 +467,8 @@ mod tests {
             "X3DH Handshake failed: Alice and Bob computed different RootKeys!"
         );
 
-        assert_eq!(alice_init.header_key, bob_init.next_header_key);
-        assert_eq!(alice_init.next_header_key, bob_init.header_key);
+        assert_eq!(alice_init.sending_header_key, bob_init.receiving_header_key);
+        assert_eq!(alice_init.receiving_header_key, bob_init.sending_header_key);
 
         type DR = crate::double_ratchet::Session<MemorySessionKeystore>;
 

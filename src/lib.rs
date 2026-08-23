@@ -273,8 +273,8 @@ pub struct SessionInit {
     pub remote_key: Option<PublicKey>,
     pub secret_key: Option<StaticSecret>,
     pub root_key: [u8; 32],
-    pub header_key: Option<[u8; 32]>,
-    pub next_header_key: Option<[u8; 32]>,
+    pub sending_header_key: Option<[u8; 32]>,
+    pub receiving_header_key: Option<[u8; 32]>,
 }
 
 pub trait SessionKeyStore<D: Data> {
