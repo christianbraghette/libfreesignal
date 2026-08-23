@@ -81,8 +81,100 @@ impl Header for SessionHeader {
     }
 }
 
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
-pub struct ChainKey([u8; 32]);
+#[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, PartialEq)]
+pub struct ChainKey {
+    remote_key: PublicKey,
+    key: [u8; 32],
+    count: u32,
+    prev: u32,
+}
+
+impl ChainKey {
+    pub fn new(bytes: [u8; 32], prev: u32, remote_key: PublicKey) -> Self {
+        Self {
+            remote_key,
+            key: bytes,
+            count: 0,
+            prev,
+        }
+    }
+
+    pub fn expand(&mut self) -> MessageKey {
+        let mut mac_msg = HmacSha256::new_from_slice(&self.key)
+            .expect("L'HMAC accetta chiavi di qualsiasi dimensione");
+        mac_msg.update(&[0x01]);
+        let msg_key_bytes: [u8; 32] = mac_msg.finalize().into_bytes().into();
+
+        let mut mac_chain = HmacSha256::new_from_slice(&self.key)
+            .expect("L'HMAC accetta chiavi di qualsiasi dimensione");
+        mac_chain.update(&[0x02]);
+        let next_chain_key_bytes: [u8; 32] = mac_chain.finalize().into_bytes().into();
+
+        self.key.zeroize();
+        self.key.copy_from_slice(&next_chain_key_bytes);
+
+        self.count += 1;
+
+        MessageKey(msg_key_bytes)
+    }
+
+    pub fn compare(&self, remote_key: &PublicKey) -> bool {
+        self.remote_key
+            .as_bytes()
+            .ct_eq(remote_key.as_bytes())
+            .unwrap_u8()
+            == 0
+    }
+
+    pub fn header(&self, public_key: PublicKey) -> SessionHeader {
+        SessionHeader {
+            count: self.count,
+            previous: self.prev,
+            public_key,
+        }
+    }
+
+    pub fn to_bytes(&self) -> [u8; 72] {
+        let mut raw = [0u8; 72];
+        raw[..32].copy_from_slice(self.remote_key.as_bytes());
+        raw[32..64].copy_from_slice(&self.key);
+        raw[64..68].copy_from_slice(&self.count.to_be_bytes());
+        raw[68..].copy_from_slice(&self.prev.to_be_bytes());
+
+        raw
+    }
+
+    pub fn from(bytes: &[u8; 72]) -> Self {
+        let mut remote_key = [0u8; 32];
+        remote_key.copy_from_slice(&bytes[..32]);
+
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes[32..64]);
+
+        let mut count = [0u8; 4];
+        count.copy_from_slice(&bytes[64..68]);
+
+        let mut prev = [0u8; 4];
+        prev.copy_from_slice(&bytes[68..]);
+
+        Self {
+            remote_key: PublicKey::from(remote_key),
+            key,
+            count: u32::from_be_bytes(count),
+            prev: u32::from_be_bytes(prev),
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() == 72 && bytes != [0u8; 72] {
+            let mut raw = [0u8; 72];
+            raw.copy_from_slice(bytes);
+            Some(Self::from(&raw))
+        } else {
+            None
+        }
+    }
+}
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct RootKey {
@@ -91,9 +183,9 @@ pub struct RootKey {
 }
 
 impl RootKey {
-    pub fn new(secret_key: StaticSecret, bytes: [u8; 32]) -> Self {
+    pub fn new(bytes: [u8; 32]) -> Self {
         Self {
-            secret_key,
+            secret_key: StaticSecret::random_from_rng(rand_core::OsRng),
             key: bytes,
         }
     }
@@ -118,6 +210,7 @@ impl RootKey {
         hkdf.expand(aad.unwrap_or(&[0u8; 32]), &mut hash_key)
             .map_err(|_| DoubleRatchetError::ChainInitFailed)?;
 
+        self.key.zeroize();
         self.key.copy_from_slice(&hash_key[0..32]);
 
         let mut chain_val = [0u8; 32];
@@ -128,7 +221,10 @@ impl RootKey {
 
         hash_key.zeroize();
 
-        Ok((ChainKey(chain_val), HeaderKey(hk_val)))
+        Ok((
+            ChainKey::new(chain_val, 0, remote_key.clone()),
+            HeaderKey(hk_val),
+        ))
     }
 
     pub fn to_bytes(&self) -> [u8; 64] {
@@ -153,19 +249,65 @@ impl RootKey {
     }
 }
 
+#[derive(Clone, Zeroize, ZeroizeOnDrop, Eq, PartialEq)]
+struct HeaderKeys {
+    curr: Option<HeaderKey>,
+    next: Option<HeaderKey>,
+}
+
+impl Default for HeaderKeys {
+    fn default() -> Self {
+        Self {
+            curr: None,
+            next: None,
+        }
+    }
+}
+
+impl HeaderKeys {
+    pub fn new(header_key: HeaderKey) -> Self {
+        Self {
+            curr: Some(header_key),
+            next: None,
+        }
+    }
+
+    pub fn new_next(header_key: HeaderKey) -> Self {
+        Self {
+            curr: None,
+            next: Some(header_key),
+        }
+    }
+
+    pub fn header_key(&self) -> Option<HeaderKey> {
+        self.curr.clone()
+    }
+
+    pub fn next_header_key(&self) -> Option<HeaderKey> {
+        self.curr.clone()
+    }
+
+    pub fn update(&mut self, header_key: HeaderKey) {
+        self.curr.zeroize();
+
+        self.curr = self.next.take();
+        self.next = Some(header_key);
+    }
+}
+
 #[derive(Zeroize, ZeroizeOnDrop, Clone)]
 pub struct SessionData {
     session_tag: SessionTag,
     #[zeroize(skip)]
     remote_identity: VerifyingKey,
     root_key: RootKey,
-    header_key: Option<HeaderKey>,
-    next_header_key: Option<HeaderKey>,
-    sending_chain: Option<Chain>,
-    receiving_chain: Option<Chain>,
+    sending_header_keys: HeaderKeys,
+    receiving_header_keys: HeaderKeys,
+    sending_chain_key: Option<ChainKey>,
+    receiving_chain_key: Option<ChainKey>,
 }
 
-const SESSION_DATA_SIZE: usize = 192 + CHAIN_SIZE * 2;
+const SESSION_DATA_SIZE: usize = 336;
 
 impl Data for SessionData {
     fn get_session_tag(&self) -> SessionTag {
@@ -178,26 +320,31 @@ impl Data for SessionData {
         raw.extend_from_slice(&self.session_tag.0);
         raw.extend_from_slice(self.remote_identity.as_bytes());
         raw.extend_from_slice(&self.root_key.to_bytes());
-        raw.extend_from_slice(self.header_key.as_ref().map(|d| &d.0).unwrap_or(&[0u8; 32]));
         raw.extend_from_slice(
-            self.next_header_key
+            self.sending_header_keys
+                .as_ref()
+                .map(|d| &d.0)
+                .unwrap_or(&[0u8; 32]),
+        );
+        raw.extend_from_slice(
+            self.receiving_header_keys
                 .as_ref()
                 .map(|d| &d.0)
                 .unwrap_or(&[0u8; 32]),
         );
         raw.extend_from_slice(
             &self
-                .sending_chain
+                .sending_chain_key
                 .as_ref()
                 .map(|d| d.to_bytes())
-                .unwrap_or([0u8; CHAIN_SIZE]),
+                .unwrap_or([0u8; 72]),
         );
         raw.extend_from_slice(
             &self
-                .receiving_chain
+                .receiving_chain_key
                 .as_ref()
                 .map(|d| d.to_bytes())
-                .unwrap_or([0u8; CHAIN_SIZE]),
+                .unwrap_or([0u8; 72]),
         );
 
         raw
@@ -220,18 +367,18 @@ impl Data for SessionData {
             remote_identity: VerifyingKey::from_bytes(&remote_identity)
                 .expect("Invalid SessionData bytes"),
             root_key: RootKey::from(&root_key),
-            header_key: if header_key == [0u8; 32] {
+            sending_header_keys: if header_key == [0u8; 32] {
                 None
             } else {
-                Some(HeaderKey(header_key))
+                Some(HeaderKeys::from(header_key))
             },
-            next_header_key: if next_header_key == [0u8; 32] {
+            receiving_header_keys: if next_header_key == [0u8; 32] {
                 None
             } else {
-                Some(HeaderKey(next_header_key))
+                Some(HeaderKeys::from(next_header_key))
             },
-            sending_chain: Chain::from_bytes(&bytes[192..192 + CHAIN_SIZE]),
-            receiving_chain: Chain::from_bytes(&bytes[192 + CHAIN_SIZE..]),
+            sending_chain_key: ChainKey::from_bytes(&bytes[192..264]),
+            receiving_chain_key: ChainKey::from_bytes(&bytes[264..]),
         }
     }
 }
@@ -263,14 +410,16 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
                         .unwrap_or_else(|| StaticSecret::random_from_rng(rand_core::OsRng)),
                     key: init.root_key,
                 },
-                header_key: init.header_key.map(|hk| HeaderKey(hk)),
-                next_header_key: init.next_header_key.map(|hk| HeaderKey(hk)),
-                /*secret_key: init
-                .secret_key
-                .clone()
-                .unwrap_or_else(|| StaticSecret::random_from_rng(rand_core::OsRng)),*/
-                sending_chain: None,
-                receiving_chain: None,
+                sending_header_keys: init
+                    .header_key
+                    .map(|hk| HeaderKeys::new(HeaderKey(hk)))
+                    .unwrap_or(HeaderKeys::default()),
+                receiving_header_keys: init
+                    .next_header_key
+                    .map(|hk| HeaderKeys::new_next(HeaderKey(hk)))
+                    .unwrap_or(HeaderKeys::default()),
+                sending_chain_key: None,
+                receiving_chain_key: None,
             },
             previous: None,
         };
@@ -283,18 +432,17 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
 
         session_tag.zeroize();
 
+        let mut sending_header_keys = session.current.sending_header_keys.clone();
+
         if let Some(remote_key) = init.remote_key {
-            session.current.sending_chain = Some(
+            session.current.sending_chain_key = Some(
                 session
-                    .expand(
-                        &remote_key,
-                        init.header_key.map(|hk| HeaderKey(hk)).as_ref(),
-                        None,
-                    )
+                    .expand(&remote_key, &mut sending_header_keys, 0)
                     .unwrap(),
             );
-            session.current.header_key = None;
         }
+
+        session.current.sending_header_keys = sending_header_keys;
 
         session.commit();
 
@@ -309,20 +457,28 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
         self.current.root_key.public_key()
     }
 
-    pub fn get_remote_hash_key(&self) -> Result<HashKey, DoubleRatchetError> {
+    pub fn hash_key(&self) -> Result<HashKey, DoubleRatchetError> {
+        if self.current.sending_chain_key.is_some() {
+            Ok(HashKey(Sha256::digest(self.public_key().as_bytes()).into()))
+        } else {
+            Err(DoubleRatchetError::NoSendingChain)
+        }
+    }
+
+    /*pub fn get_remote_hash_key(&self) -> Result<HashKey, DoubleRatchetError> {
         self.current
             .sending_chain
             .as_ref()
-            .map(|c| HashKey(Sha256::digest(c.public_key.as_bytes()).into()))
+            .map(|c| HashKey(Sha256::digest(c.chain_key.remote_key.as_bytes()).into()))
             .ok_or(DoubleRatchetError::NoSendingChain)
-    }
+    }*/
 
     fn expand(
         &mut self,
         remote_key: &PublicKey,
-        header_key: Option<&HeaderKey>,
-        previous_count: Option<u32>,
-    ) -> Result<Chain, DoubleRatchetError> {
+        header_keys: &mut HeaderKeys,
+        previous_count: u32,
+    ) -> Result<ChainKey, DoubleRatchetError> {
         let local_identity = self.keystore.get_verifying_key();
         let remote_identity = &self.current.remote_identity;
 
@@ -346,7 +502,7 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
 
         info_buf[offset..offset + 32].copy_from_slice(key_2);
 
-        let (chain_key, next_header_key) = self
+        let (mut chain_key, next_header_key) = self
             .current
             .root_key
             .expand(&remote_key, Some(&info_buf))
@@ -354,17 +510,11 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
 
         info_buf.zeroize();
 
-        let chain = Chain {
-            count: 0,
-            public_key: self.public_key(),
-            remote_key: remote_key.clone(),
-            chain_key,
-            next_header_key,
-            header_key: header_key.cloned(),
-            previous_count: previous_count.unwrap_or(0),
-        };
+        chain_key.prev = previous_count;
 
-        Ok(chain)
+        header_keys.update(next_header_key);
+
+        Ok(chain_key)
     }
 
     pub fn commit(&mut self) {
@@ -386,30 +536,26 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
         false
     }
 
-    pub fn get_header_key(&self) -> Option<HeaderKey> {
-        self.current.header_key.clone().or(self
-            .current
-            .sending_chain
-            .as_ref()
-            .map(|d| d.header_key.clone())
-            .flatten())
+    pub fn header_key(&self) -> Option<HeaderKey> {
+        self.current.sending_header_keys.header_key()
     }
 
     pub fn get_sending_key(
         &mut self,
     ) -> Result<(MessageKey, SessionHeader, Option<HeaderKey>), DoubleRatchetError> {
+        let public_key = self.public_key();
+
         let chain = self
             .current
-            .sending_chain
+            .sending_chain_key
             .as_mut()
             .ok_or(DoubleRatchetError::NoSendingChain)?;
 
-        let msg_key = chain.get_key();
+        let msg_key = chain.expand();
 
-        let header_key: Option<HeaderKey> =
-            self.current.header_key.clone().or(chain.header_key.clone());
+        let header_key: Option<HeaderKey> = self.current.sending_header_keys.header_key();
 
-        Ok((msg_key, chain.get_header(), header_key))
+        Ok((msg_key, chain.header(public_key), header_key))
     }
 
     pub fn get_receiving_key(
@@ -422,20 +568,17 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
             return Ok(key);
         }
 
-        let is_new_remote_key = match &self.current.receiving_chain {
-            Some(chain) => {
-                chain
-                    .remote_key
-                    .as_bytes()
-                    .ct_eq(header.get_public_key().as_bytes())
-                    .unwrap_u8()
-                    == 0
-            }
+        let is_new_remote_key = match &self.current.receiving_chain_key {
+            Some(chain) => chain.compare(&header.public_key),
             None => true,
         };
 
         if is_new_remote_key {
-            let previous_rc_count = self.current.receiving_chain.as_ref().map_or(0, |c| c.count);
+            let previous_rc_count = self
+                .current
+                .receiving_chain_key
+                .as_ref()
+                .map_or(0, |c| c.count);
             if header.previous < previous_rc_count {
                 return Err(DoubleRatchetError::InvalidHeader);
             }
@@ -446,7 +589,11 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
                 return Err(DoubleRatchetError::MaxSkipExceeded);
             }
         } else {
-            let current_rc_count = self.current.receiving_chain.as_ref().map_or(0, |c| c.count);
+            let current_rc_count = self
+                .current
+                .receiving_chain_key
+                .as_ref()
+                .map_or(0, |c| c.count);
             if header.count < current_rc_count {
                 return Err(DoubleRatchetError::ChainNotFound);
             }
@@ -456,64 +603,56 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
         }
 
         if is_new_remote_key {
-            let old_receiving_chain = self.current.receiving_chain.clone();
-            let mut previous_count = old_receiving_chain.as_ref().map(|c| c.count);
-            let mut rc_header_key: Option<HeaderKey> = self.current.next_header_key.clone();
+            let old_receiving_chain = self.current.receiving_chain_key.clone();
+            let mut previous_count = old_receiving_chain.as_ref().map(|c| c.count).unwrap_or(0);
+            let mut rc_header_keys = self.current.receiving_header_keys.clone();
 
             if let Some(mut rc) = old_receiving_chain {
                 while rc.count < header.previous {
-                    let key = rc.get_key();
+                    let key = rc.expand();
                     self.keystore.set_previous_keys(&session_tag, &key);
                 }
-                previous_count = Some(rc.count);
-
-                rc_header_key = rc_header_key.or(Some(rc.next_header_key.clone()));
+                previous_count = rc.count;
             }
 
-            let new_rc = self.expand(
+            self.current.receiving_chain_key = Some(self.expand(
                 &header.get_public_key(),
-                rc_header_key.as_ref(),
+                &mut rc_header_keys,
                 previous_count,
-            )?;
-            self.current.receiving_chain = Some(new_rc.clone());
+            )?);
 
             self.current.root_key.update();
 
-            let new_pub_key = self.public_key();
+            let new_pub_key = self.current.root_key.public_key();
             let hash_key: [u8; 32] = Sha256::digest(new_pub_key.as_bytes()).into();
 
-            if let Some(old_nhk) = &rc_header_key {
+            if let Some(header_key) = rc_header_keys.header_key() {
                 self.keystore
-                    .set_header_key(&HashKey(hash_key.clone()), old_nhk);
+                    .set_header_key(&HashKey(hash_key.clone()), &header_key);
             }
+
+            self.current.receiving_header_keys = rc_header_keys;
 
             self.keystore.set_hash_key(&HashKey(hash_key), &session_tag);
 
-            if self.current.next_header_key.is_some() {
-                self.current.next_header_key = None;
-            }
-
-            let old_sending_chain = self.current.sending_chain.clone();
+            let old_sending_chain = self.current.sending_chain_key.clone();
             let sending_chain_count = old_sending_chain.as_ref().map(|c| c.count).unwrap_or(0);
-            let sc_next_hk = old_sending_chain.map(|c| c.next_header_key.clone());
-            let sc_header_key = self.current.header_key.clone().or(sc_next_hk);
 
-            self.current.sending_chain = Some(self.expand(
+            let mut sc_header_keys = self.current.sending_header_keys.clone();
+
+            self.current.sending_chain_key = Some(self.expand(
                 &header.get_public_key(),
-                sc_header_key.as_ref(),
-                Some(sending_chain_count),
+                &mut sc_header_keys,
+                sending_chain_count,
             )?);
-
-            if self.current.header_key.is_some() {
-                self.current.header_key = None;
-            }
+            self.current.sending_header_keys = sc_header_keys;
         }
 
-        let receiving_chain = self.current.receiving_chain.as_mut().unwrap();
+        let receiving_chain = self.current.receiving_chain_key.as_mut().unwrap();
 
         let mut final_key: Option<MessageKey> = None;
         while receiving_chain.count < header.count {
-            let key = receiving_chain.get_key();
+            let key = receiving_chain.expand();
             if receiving_chain.count == header.count {
                 final_key = Some(key);
             } else {
@@ -573,14 +712,12 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
     }
 }
 
-const CHAIN_SIZE: usize = 168;
+/*const CHAIN_SIZE: usize = 168;
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Chain {
     count: u32,
     previous_count: u32,
-    public_key: PublicKey,
-    remote_key: PublicKey,
     header_key: Option<HeaderKey>,
     next_header_key: HeaderKey,
     chain_key: ChainKey,
@@ -662,7 +799,7 @@ impl Chain {
             })
         }
     }
-}
+}*/
 
 #[cfg(test)]
 mod tests {
@@ -940,7 +1077,8 @@ mod tests {
         let mut session = Session::new(&bob_init, bob_keystore);
 
         let fake_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
-        session.current.sending_chain = Some(session.expand(&fake_remote, None, Some(5)).unwrap());
+        session.current.sending_chain_key =
+            Some(session.expand(&fake_remote, None, Some(5)).unwrap());
 
         let bytes = session.current.to_bytes();
         let decoded = SessionData::from_bytes(&bytes);
@@ -955,10 +1093,16 @@ mod tests {
             decoded.root_key.secret_key.to_bytes()
         );
         //assert_eq!(session.current.root_key, decoded.root_key);
-        assert_eq!(session.current.header_key, decoded.header_key);
-        assert_eq!(session.current.next_header_key, decoded.next_header_key);
-        assert!(decoded.sending_chain.is_some());
-        assert_eq!(decoded.sending_chain.clone().unwrap().previous_count, 5);
+        assert_eq!(
+            session.current.sending_header_keys,
+            decoded.sending_header_keys
+        );
+        assert_eq!(
+            session.current.receiving_header_keys,
+            decoded.receiving_header_keys
+        );
+        assert!(decoded.sending_chain_key.is_some());
+        assert_eq!(decoded.sending_chain_key.clone().unwrap().previous_count, 5);
     }
 
     #[test]
@@ -1006,7 +1150,7 @@ mod tests {
         let old_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
         let mut mock_rc = bob_session.expand(&old_remote, None, None).unwrap();
         mock_rc.count = 50;
-        bob_session.current.receiving_chain = Some(mock_rc);
+        bob_session.current.receiving_chain_key = Some(mock_rc);
 
         let new_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
         let bad_header = SessionHeader {
@@ -1039,7 +1183,7 @@ mod tests {
 
         let fake_remote = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
         let new_chain = session.expand(&fake_remote, None, None).unwrap();
-        session.current.receiving_chain = Some(new_chain);
+        session.current.receiving_chain_key = Some(new_chain);
 
         //assert_ne!(session.current.root_key, initial_root);
 
