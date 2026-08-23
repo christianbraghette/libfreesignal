@@ -202,6 +202,7 @@ impl RootKey {
     pub fn expand(
         &mut self,
         remote_key: PublicKey,
+        prev_count: u32,
         aad: Option<&[u8]>,
     ) -> Result<(ChainKey, HeaderKey), DoubleRatchetError> {
         let shared_key = self.secret_key.diffie_hellman(&remote_key);
@@ -222,7 +223,7 @@ impl RootKey {
 
         hash_key.zeroize();
 
-        Ok((ChainKey::new(chain_val, 0, remote_key), HeaderKey(hk_val)))
+        Ok((ChainKey::new(chain_val, prev_count, remote_key), HeaderKey(hk_val)))
     }
 
     pub fn to_bytes(&self) -> [u8; 64] {
@@ -493,14 +494,13 @@ impl<K: SessionKeyStore<SessionData>> Session<K> {
 
         info_buf[offset..offset + 32].copy_from_slice(key_2);
 
-        let (mut chain_key, next_header_key) = self
+        let (chain_key, next_header_key) = self
             .current
             .root_key
-            .expand(remote_key.clone(), Some(&info_buf))
+            .expand(remote_key.clone(), previous_count, Some(&info_buf))
             .map_err(|_| DoubleRatchetError::ChainInitFailed)?;
 
         info_buf.zeroize();
-        chain_key.prev = previous_count;
 
         header_keys.update(next_header_key);
 

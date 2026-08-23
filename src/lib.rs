@@ -435,14 +435,11 @@ pub mod xed25519 {
     use x25519_dalek::{PublicKey, StaticSecret};
 
     pub fn signing_to_secret(signing_key: &SigningKey) -> StaticSecret {
-        // 1. Calcola l'hash SHA-512 dei 32 byte del seed Ed25519
         let hash = Sha512::digest(signing_key.as_bytes());
 
-        // 2. Prendi i primi 32 byte dell'output
         let mut scalar_bytes = [0u8; 32];
         scalar_bytes.copy_from_slice(&hash[..32]);
 
-        // 3. Clamping esplicito secondo la specifica Curve25519 / XEd25519
         scalar_bytes[0] &= 248; // Azzera i 3 bit meno significativi (gestione del cofattore 8)
         scalar_bytes[31] &= 127; // Azzera il bit 255
         scalar_bytes[31] |= 64; // Imposta il bit 254 a 1
