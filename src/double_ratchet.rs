@@ -349,12 +349,10 @@ impl Data for SessionData {
         raw
     }
 
-    fn from_bytes(bytes: &[u8]) -> Self {
-        assert_eq!(
-            bytes.len(),
-            SESSION_DATA_SIZE,
-            "Invalid SessionData buffer size"
-        );
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != SESSION_DATA_SIZE {
+            return None;
+        }
 
         let mut session_tag = [0u8; 32];
         session_tag.copy_from_slice(&bytes[0..32]);
@@ -371,7 +369,7 @@ impl Data for SessionData {
         let mut receiving_hk = [0u8; 64];
         receiving_hk.copy_from_slice(&bytes[192..256]);
 
-        Self {
+        Some(Self {
             session_tag: SessionTag(session_tag),
             remote_identity: VerifyingKey::from_bytes(&remote_identity)
                 .expect("Invalid SessionData bytes"),
@@ -380,7 +378,7 @@ impl Data for SessionData {
             receiving_header_keys: HeaderKeys::from_bytes(&receiving_hk),
             sending_chain_key: ChainKey::from_bytes(&bytes[256..328]),
             receiving_chain_key: ChainKey::from_bytes(&bytes[328..400]),
-        }
+        })
     }
 }
 
@@ -980,7 +978,7 @@ mod tests {
         session.current.sending_chain_key = Some(session.expand(&fake_remote, &mut hk, 5).unwrap());
 
         let bytes = session.current.to_bytes();
-        let decoded = SessionData::from_bytes(&bytes);
+        let decoded = SessionData::from_bytes(&bytes).unwrap();
 
         assert_eq!(session.current.session_tag.0, decoded.session_tag.0);
         assert_eq!(

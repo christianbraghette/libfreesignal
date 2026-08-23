@@ -263,7 +263,9 @@ pub trait Header {
 pub trait Data {
     fn get_session_tag(&self) -> SessionTag;
     fn to_bytes(&self) -> Vec<u8>;
-    fn from_bytes(bytes: &[u8]) -> Self;
+    fn from_bytes(bytes: &[u8]) -> Option<Self>
+    where
+        Self: Sized;
 }
 
 #[derive(Zeroize, ZeroizeOnDrop, Clone)]
